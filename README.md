@@ -34,7 +34,11 @@ pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 ## Run
 
 ```bash
+# From source / pip install
 uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
+
+# Or the published image (multi-arch amd64 + arm64)
+docker run -p 8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
 ```
 
 The sqlite repository self-creates its schema at runtime; for Oracle, apply `mnemos/hive_mind/oracle_ddl.sql`. The shared hive *ledger* tables (`agents`, `jobs`, `subscription_pools`, …) are owned by `mnemos-core`'s migration runner and shared with KNEMON.
