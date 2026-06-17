@@ -1,6 +1,6 @@
-# mnemos-hive
+# mnemos-stiphos
 
-**GRAEAE Hive Mind** — fleet-wide agent coordination, a claim/triage job queue, and cost-tier dispatch for the MNEMOS family.
+**STIPHOS** (Στίφος — "a marshaled host") — the GRAEAE Hive Mind: fleet-wide agent coordination, a claim/triage job queue, and cost-tier dispatch for the MNEMOS family. A disciplined swarm of worker agents, marshaled and dispatched.
 
 > **Status: beta (v0.2.0 / Phase 1).** This subsystem is carved out of `mnemos-core` precisely so its faster, less-settled release cadence does not destabilize the stable core. It is **not** part of the core umbrella image; deploy it as its own service.
 
@@ -24,12 +24,12 @@
 ## Install
 
 ```bash
-pip install mnemos-hive            # sqlite repository, REST service
-pip install "mnemos-hive[oracle]"  # + Oracle 23ai backend
-pip install "mnemos-hive[mcp]"     # + MCP-SSE bridge
+pip install mnemos-stiphos            # sqlite repository, REST service
+pip install "mnemos-stiphos[oracle]"  # + Oracle 23ai backend
+pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 ```
 
-`mnemos-hive` contributes the `mnemos.hive_mind` subpackage to the shared PEP 420 `mnemos.*` namespace and depends on `mnemos-core` for config and persistence helpers.
+`mnemos-stiphos` contributes the `mnemos.hive_mind` subpackage to the shared PEP 420 `mnemos.*` namespace and depends on `mnemos-core` for config and persistence helpers. (The distribution is named STIPHOS; the module path stays `mnemos.hive_mind`.)
 
 ## Run
 

@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mnemos-hive"
+name = "mnemos-stiphos"
 version = "0.2.0"
-description = "GRAEAE Hive Mind for the Mnemos namespace: fleet-wide agent coordination, a claim/triage job queue, and cost-tier dispatch. Beta — carved out of mnemos-core so its release cadence is decoupled from the stable core."
+description = "STIPHOS (Στίφος, \"a marshaled host\") — the GRAEAE Hive Mind for the Mnemos namespace: fleet-wide agent coordination, a claim/triage job queue, and cost-tier dispatch. Beta — carved out of mnemos-core so its release cadence is decoupled from the stable core."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -29,8 +29,8 @@ oracle = ["oracledb>=4.0.1"]
 test = ["pytest", "pytest-asyncio", "httpx>=0.27.0"]
 
 [project.urls]
-Homepage = "https://gitlab.com/ncz-os/mnemos-hive"
-Repository = "https://gitlab.com/ncz-os/mnemos-hive"
+Homepage = "https://gitlab.com/ncz-os/mnemos-stiphos"
+Repository = "https://gitlab.com/ncz-os/mnemos-stiphos"
 
 [tool.setuptools.packages.find]
 where = ["."]
