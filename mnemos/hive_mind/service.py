@@ -758,7 +758,48 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
+# ---- Bus authentication (defense-in-depth) -------------------------------
+# Lock the mutating surface (register / job create / claim / message /
+# schedule) behind a bearer token. This image is published publicly
+# (ghcr.io/ncz-os/mnemos-stiphos), so an unauthenticated default is a real
+# exposure once deployed off a trusted LAN. NO source-baked default: when
+# unset the bus stays open (Phase-1 behavior) so nothing changes until a token
+# is configured. Accept a comma-separated list (HIVE_BUS_TOKEN and/or
+# HIVE_BUS_TOKENS) so tokens can be rotated without a flag-day.
+_HIVE_BUS_TOKENS = {
+    t.strip()
+    for t in (
+        os.environ.get("HIVE_BUS_TOKEN", "") + "," + os.environ.get("HIVE_BUS_TOKENS", "")
+    ).split(",")
+    if t.strip()
+}
+_BUS_AUTH_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_BUS_AUTH_EXEMPT_PATHS = frozenset({"/health", "/"})
+
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _bus_auth_middleware(request: Request, call_next):
+    """Require a bearer token for state-changing requests when _HIVE_BUS_TOKENS
+    is configured. No-op when unset. Read-only verbs and /health + / stay open
+    so the dashboard and SSE stream work without distributing a token."""
+    if (
+        _HIVE_BUS_TOKENS
+        and request.method not in _BUS_AUTH_SAFE_METHODS
+        and request.url.path not in _BUS_AUTH_EXEMPT_PATHS
+    ):
+        authz = request.headers.get("authorization", "")
+        token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
+        if not token or not any(secrets.compare_digest(token, t) for t in _HIVE_BUS_TOKENS):
+            return JSONResponse(
+                {
+                    "detail": "unauthorized: missing or invalid Hive bus token "
+                    "(send Authorization: Bearer <HIVE_BUS_TOKEN>)"
+                },
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 # ---------- endpoints ----------

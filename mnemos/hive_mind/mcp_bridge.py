@@ -25,6 +25,7 @@ Tools:
 from __future__ import annotations
 import json
 import os
+import secrets
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
@@ -42,6 +44,14 @@ HIVE_URL = mcp_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+# Valid inbound tokens (primary + comma-separated rotation set). When non-empty
+# the bridge enforces a bearer token on inbound message POSTs so it is not an
+# unauthenticated bypass of the bus lock. When empty the bridge stays open.
+_HIVE_BUS_TOKENS = {
+    t.strip()
+    for t in (HIVE_BUS_TOKEN + "," + os.environ.get("HIVE_BUS_TOKENS", "")).split(",")
+    if t.strip()
+}
 MNEMOS_URL = mcp_mnemos_url_env()
 MNEMOS_TOKEN = mcp_mnemos_token_env()
 
@@ -344,6 +354,22 @@ app = Starlette(
         Mount("/messages/", app=sse.handle_post_message),
     ],
 )
+
+
+@app.middleware("http")
+async def _bridge_auth_middleware(request, call_next):
+    """Require the Hive bus bearer token on inbound message POSTs when
+    _HIVE_BUS_TOKENS is configured. No-op when unset. The /sse GET stream stays
+    open (it carries no tool calls); tool invocations arrive via POST."""
+    if _HIVE_BUS_TOKENS and request.method not in ("GET", "HEAD", "OPTIONS"):
+        authz = request.headers.get("authorization", "")
+        token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
+        if not token or not any(secrets.compare_digest(token, t) for t in _HIVE_BUS_TOKENS):
+            return JSONResponse(
+                {"detail": "unauthorized: missing or invalid Hive bus token"},
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 if __name__ == "__main__":
