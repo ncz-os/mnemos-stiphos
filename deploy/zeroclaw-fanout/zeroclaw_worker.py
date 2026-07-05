@@ -42,7 +42,7 @@ from typing import Optional
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "zeroclaw")
 ZEROCLAW_AGENT = os.environ.get("ZEROCLAW_AGENT", "hive")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
@@ -333,39 +333,22 @@ def _detect_subscription_pools() -> list[str]:
 
     for env_name in ("CLAUDE_SUBSCRIPTION_TIER",):
         if os.environ.get(env_name):
-            tier = os.environ[env_name]
-            if "max" in tier.lower():
-                pools.add("anthropic.claude_max")
+            _add_plan_aliases(pools, "anthropic", os.environ[env_name])
     if os.environ.get("CHATGPT_PLAN"):
-        plan = os.environ["CHATGPT_PLAN"].lower()
-        if "pro" in plan:
-            pools.add("openai.chatgpt_pro")
-        elif "plus" in plan:
-            pools.add("openai.chatgpt_plus")
+        _add_plan_aliases(pools, "openai", os.environ["CHATGPT_PLAN"], family="chatgpt")
     if os.environ.get("CODEX_PLAN"):
-        plan = os.environ["CODEX_PLAN"].lower()
-        if "pro" in plan:
-            pools.add("openai.codex_pro")
-        elif "plus" in plan:
-            pools.add("openai.codex_plus")
+        _add_plan_aliases(pools, "openai", os.environ["CODEX_PLAN"], family="codex")
+    for pool in os.environ.get("OPENAI_SUBSCRIPTION_POOLS", "").split(","):
+        _add_plan_aliases(pools, "openai", pool)
 
     # scan configs for .claude, .codex, .chatgpt
     for config_dir in (home / ".claude", home / ".codex", home / ".chatgpt"):
         for f in config_dir.glob("**/*"):
             if f.is_file():
-                try:
-                    text = f.read_text(encoding="utf-8", errors="ignore").lower()
-                    if "claude_max" in text:
-                        pools.add("anthropic.claude_max")
-                    if "chatgpt_pro" in text:
-                        pools.add("openai.chatgpt_pro")
-                    if "codex_pro" in text:
-                        pools.add("openai.codex_pro")
-                except:
-                    pass
+                _scan_subscription_config(f, pools)
 
     if (home / ".anthropic" / "auth.json").exists():
-        pools.add("anthropic.claude_max")
+        _add_plan_aliases(pools, "anthropic", "claude_max_100")
 
     return sorted(pools)
 

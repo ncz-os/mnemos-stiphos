@@ -41,7 +41,7 @@ from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemo
 HIVE_URL = mcp_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 MNEMOS_URL = mcp_mnemos_url_env()
 MNEMOS_TOKEN = mcp_mnemos_token_env()
 

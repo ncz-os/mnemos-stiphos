@@ -34,12 +34,16 @@ pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 ## Run
 
 ```bash
+export HIVE_BUS_TOKEN="$(openssl rand -hex 32)"
+
 # From source / pip install
-uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
+HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
 
 # Or the published image (multi-arch amd64 + arm64)
-docker run -p 8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
+docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -p 127.0.0.1:8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
 ```
+
+All routes except `/health` require `Authorization: Bearer $HIVE_BUS_TOKEN` by default. Set `HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests. Workers and bridges read `HIVE_BUS_TOKEN` or `MNEMOS_HIVE_BUS_TOKEN` and attach the bearer token automatically.
 
 The sqlite repository self-creates its schema at runtime; for Oracle, apply `mnemos/hive_mind/oracle_ddl.sql`. The shared hive *ledger* tables (`agents`, `jobs`, `subscription_pools`, …) are owned by `mnemos-core`'s migration runner and shared with KNEMON.
 

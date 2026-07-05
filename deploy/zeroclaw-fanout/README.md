@@ -89,6 +89,7 @@ Set subscription pools explicitly in the worker environment when a host has
 interactive subscription access. Use family-specific pools by default:
 
 ```bash
+HIVE_BUS_TOKEN=<same bearer token configured on graeae-hive>
 CHATGPT_PLAN=chatgpt_pro_100          # or chatgpt_plus / chatgpt_pro_200
 CODEX_PLAN=codex_pro_200             # or codex_plus / codex_pro_100
 CLAUDE_SUBSCRIPTION_TIER=claude_max_100

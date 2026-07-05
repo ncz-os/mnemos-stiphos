@@ -36,7 +36,7 @@ from mnemos.core.config import agent_host_env, claim_jobs_enabled_env, heartbeat
 
 HIVE_URL = system_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced, never baked in).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 AGENT_HOST = agent_host_env()
 HEARTBEAT_INTERVAL = heartbeat_interval_env()
 CLAIM_JOBS = claim_jobs_enabled_env()

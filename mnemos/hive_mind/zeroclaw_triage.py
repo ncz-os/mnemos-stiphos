@@ -22,7 +22,7 @@ HIVE_URL = os.environ.get("HIVE_URL") or system_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). _http_json is generic, so we
 # pass this explicitly as `bearer` on the hive calls below (the /v1/jobs read +
 # routing PATCH are admin-tier on the bus).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL") or mcp_mnemos_url_env()
 MNEMOS_TOKEN = os.environ.get("MNEMOS_API_KEY") or os.environ.get("MNEMOS_TOKEN") or mcp_mnemos_token_env()
 POLL_INTERVAL = float(os.environ.get("ZEROCLAW_TRIAGE_POLL_INTERVAL", "10"))

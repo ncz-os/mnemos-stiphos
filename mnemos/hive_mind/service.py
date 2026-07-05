@@ -27,6 +27,10 @@ from sse_starlette.sse import EventSourceResponse
 from mnemos.core.config import agent_bus_db_env
 
 DB_PATH = agent_bus_db_env()
+HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
+HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_PUBLIC_PATHS = {"/health"}
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -42,6 +46,41 @@ EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 
 
 # ---------- helpers ----------
+
+
+def _env_bool(names: tuple[str, ...], *, default: bool) -> bool:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is not None:
+            return raw.strip().lower() not in _FALSE_ENV_VALUES
+    return default
+
+
+def _configured_bus_tokens() -> tuple[str, ...]:
+    tokens: list[str] = []
+    for name in HIVE_BUS_TOKEN_ENV_NAMES:
+        raw = os.environ.get(name, "")
+        tokens.extend(token.strip() for token in raw.split(",") if token.strip())
+    return tuple(dict.fromkeys(tokens))
+
+
+def _hive_bus_auth_required() -> bool:
+    return _env_bool(HIVE_BUS_AUTH_REQUIRED_ENV_NAMES, default=True)
+
+
+def _bearer_token(request: Request) -> str | None:
+    value = request.headers.get("authorization", "")
+    scheme, _, token = value.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def _request_has_valid_bus_token(request: Request, expected_tokens: tuple[str, ...]) -> bool:
+    supplied = _bearer_token(request)
+    if supplied is None:
+        return False
+    return any(secrets.compare_digest(supplied, expected) for expected in expected_tokens)
 
 
 def uuidv7() -> str:
@@ -759,6 +798,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_hive_bus_bearer(request: Request, call_next):
+    if request.url.path.rstrip("/") in _PUBLIC_PATHS:
+        return await call_next(request)
+    if not _hive_bus_auth_required():
+        return await call_next(request)
+
+    expected_tokens = _configured_bus_tokens()
+    if not expected_tokens:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "Hive bus authentication is required, but no HIVE_BUS_TOKEN "
+                    "or MNEMOS_HIVE_BUS_TOKEN is configured."
+                )
+            },
+        )
+    if not _request_has_valid_bus_token(request, expected_tokens):
+        return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
+    return await call_next(request)
 
 
 # ---------- endpoints ----------
