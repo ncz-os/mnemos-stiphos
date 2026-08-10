@@ -30,6 +30,7 @@ import json
 import os
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.request
@@ -423,7 +424,7 @@ def claim_next_job() -> dict | None:
     return None
 
 
-def update_job(job_id: str, status: str, result: dict):
+def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = False) -> bool:
     body = {"status": status, "result": result, "claimed_by": _urn}
     if isinstance(result, dict):
         t_in = result.get("tokens_in")
@@ -432,7 +433,17 @@ def update_job(job_id: str, status: str, result: dict):
             body["tokens_in"] = int(t_in)
         if t_out is not None:
             body["tokens_out"] = int(t_out)
-    _http("PATCH", f"/v1/jobs/{job_id}", body)
+    delay = 1.0
+    while _running:
+        code, resp = _http("PATCH", f"/v1/jobs/{job_id}", body)
+        if 200 <= code < 300:
+            return True
+        print(f"[zc-worker] job update unacknowledged status={status} code={code} resp={resp}", flush=True)
+        if not require_ack:
+            return False
+        time.sleep(delay)
+        delay = min(delay * 2, 30.0)
+    return False
 
 
 ERR_PATTERNS = [
@@ -521,7 +532,7 @@ def _git(workspace: str, *args, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> Optional[str]:
+def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> str:
     """Clone repo + checkout branch into the AGENT'S workspace.
 
     zeroclaw 0.8 file_write/shell tools are jailed to the agent's
@@ -531,7 +542,7 @@ def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> Option
     Per-instance isolation: workspace path includes INSTANCE id so
     multiple workers on same alias don't collide.
 
-    Returns workspace path on success; None on failure.
+    Returns workspace path on success; raises with the Git error on failure.
     """
     short = job_id[:8]
     alias = agent_alias or os.environ.get("ZEROCLAW_AGENT", "hive")
@@ -550,8 +561,7 @@ def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> Option
             timeout=300,
         )
         if r.returncode != 0:
-            print(f"[zc-worker] clone failed: {r.stderr[:400]}", flush=True)
-            return None
+            raise RuntimeError(f"git clone failed: {r.stderr[:400]}")
         # Set per-workspace git identity
         _git(workspace, "config", "user.name", GIT_USER_NAME)
         _git(workspace, "config", "user.email", GIT_USER_EMAIL)
@@ -575,7 +585,7 @@ def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> Option
         return workspace
     except Exception as exc:
         print(f"[zc-worker] workspace prep failed: {type(exc).__name__}: {exc}", flush=True)
-        return None
+        raise
 
 
 def _capture_changes(workspace: str) -> dict:
@@ -624,11 +634,11 @@ def _commit_and_push(workspace: str, job_id: str, kind: str, branch: str, base_r
             timeout=120,
         )
         if push.returncode != 0:
-            print(f"[zc-worker] push failed: {push.stderr[:400]}", flush=True)
+            raise RuntimeError(f"git push failed: {push.stderr[:400]}")
         else:
             print(f"[zc-worker] pushed {len(commits)} commit(s) to origin/{branch}: {commits[0][:10]}", flush=True)
     except subprocess.CalledProcessError as exc:
-        print(f"[zc-worker] commit/push exc: {exc.stderr[:200] if exc.stderr else exc}", flush=True)
+        raise RuntimeError(f"git commit/push failed: {exc.stderr[:400] if exc.stderr else exc}") from exc
     return commits
 
 
@@ -639,10 +649,24 @@ def _cleanup_workspace(workspace: str) -> None:
         pass
 
 
+def _preserve_workspace(workspace: str, job_id: str) -> str:
+    """Move unpublished work aside so a later job cannot wipe it."""
+    recovery = f"{workspace}.unpublished-{job_id[:8]}-{int(time.time())}"
+    os.replace(workspace, recovery)
+    return recovery
+
+
+def _read_output_tail(output_file, limit: int) -> str:
+    output_file.seek(0, os.SEEK_END)
+    size = output_file.tell()
+    output_file.seek(max(0, size - limit), os.SEEK_SET)
+    return output_file.read().decode("utf-8", errors="replace")
+
+
 TIER_PROVIDER_MAP = {
-    "A": os.environ.get("ZC_TIER_A_PROVIDER", "anthropic.opus_4_6"),
+    "A": os.environ.get("ZC_TIER_A_PROVIDER", "nvidia.kimi"),
     "B": os.environ.get("ZC_TIER_B_PROVIDER", "groq.default"),
-    "C": os.environ.get("ZC_TIER_C_PROVIDER", "nvidia.kimi"),
+    "C": os.environ.get("ZC_TIER_C_PROVIDER", "anthropic.opus_4_6"),
 }
 
 # Fallback chains per tier. Each entry = agent ALIAS (NOT provider type).
@@ -687,9 +711,9 @@ def _registry_chain_for_tier(tier: str) -> list:
         return []
     # Map our internal A/B/C tiers to registry tier-pick keys
     tier_map = {
-        "A": ["C_g1_critical", "B_quality_surgical"],  # premium first
-        "B": ["B_fanout_high_volume", "S_free_default"],
-        "C": ["S_free_default", "B_fanout_high_volume"],
+        "A": ["S_free_default"],
+        "B": ["S_free_default", "B_fanout_high_volume"],
+        "C": ["S_free_default", "B_fanout_high_volume", "B_quality_surgical", "C_g1_critical"],
     }
     pick_keys = tier_map.get(tier.upper(), tier_map["C"])
     alias_chain = []
@@ -722,11 +746,29 @@ def _provider_to_alias(prov: str) -> str:
 
 def _build_tier_chain(tier: str) -> list:
     """Build chain for a tier. Prefer registry; fall back to hard-coded."""
+    tier = tier.upper()
     reg_chain = _registry_chain_for_tier(tier)
-    if reg_chain:
-        return reg_chain
-    # Hard-coded fallback
-    return _HARDCODED_FALLBACK[tier.upper()]
+    candidates = reg_chain or _HARDCODED_FALLBACK[tier]
+    tier_order = {"A": 0, "B": 1, "C": 2}
+    provider_tiers = {
+        "ngc": "A",
+        "nvidia": "A",
+        "local": "A",
+        "groq": "B",
+        "deepseek-direct": "B",
+        "siliconflow": "B",
+        "together": "B",
+        "xai": "B",
+        "anthropic": "C",
+        "openai": "C",
+        "gemini": "C",
+        "unknown": "C",
+    }
+    return [
+        alias
+        for alias in candidates
+        if tier_order[provider_tiers[_alias_to_provider(alias)]] <= tier_order[tier]
+    ]
 
 
 _FALLBACK_DEEPSEEK = os.environ.get("ZC_FALLBACK_DEEPSEEK", f"hive_deepseek_{_INST}")
@@ -739,13 +781,7 @@ _FALLBACK_SILICONFLOW = os.environ.get("ZC_FALLBACK_SILICONFLOW", f"hive_silicon
 # 4. Together MiniMax-M2.7 ($0.40/$1.20) — last paid resort
 # 5. xAI Grok 4.1 Fast / OpenAI — emergency
 _HARDCODED_FALLBACK = {
-    "A": [
-        os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
-        "hive_openai",
-        "hive_gemini",
-        _FALLBACK_DEEPSEEK,
-        _FALLBACK_TOGETHER,
-    ],
+    "A": [os.environ.get("ZC_TIER_A_AGENT", _PRIMARY_BC)],
     "B": [
         _PRIMARY_BC,
         _FALLBACK_DEEPSEEK,
@@ -753,15 +789,39 @@ _HARDCODED_FALLBACK = {
         _FALLBACK_TOGETHER,
         _FALLBACK_SILICONFLOW,
         "hive_xai",
-        "hive_openai",
     ],
     "C": [
         _PRIMARY_BC,
         _FALLBACK_DEEPSEEK,
         "hive_groq_8b",
         _FALLBACK_TOGETHER,
+        _FALLBACK_SILICONFLOW,
+        "hive_xai",
+        "hive_anthropic",
+        "hive_openai",
+        "hive_gemini",
     ],
 }
+
+
+def _alias_to_provider(alias: str) -> str:
+    """Return the service cost-accounting provider for a Zeroclaw alias."""
+    value = (alias or "").lower()
+    for marker, provider in (
+        ("nvidia", "nvidia"),
+        ("ngc", "ngc"),
+        ("groq", "groq"),
+        ("deepseek", "deepseek-direct"),
+        ("siliconflow", "siliconflow"),
+        ("together", "together"),
+        ("xai", "xai"),
+        ("anthropic", "anthropic"),
+        ("openai", "openai"),
+        ("gemini", "gemini"),
+    ):
+        if marker in value:
+            return provider
+    return "unknown"
 
 
 class _ChainProxy(dict):
@@ -847,10 +907,17 @@ def run_zeroclaw(
         # Workspace path is per-agent-alias; use first chain entry (final_provider may
         # change on rate-limit but workspace is shared across all chain attempts)
         first_alias = TIER_FALLBACK_CHAIN.get((max_cost_tier or "C").upper(), TIER_FALLBACK_CHAIN["C"])[0]
-        workspace = _prepare_workspace(job_id or "anon", repo, agent_alias=first_alias)
-        if workspace:
-            branch = repo.get("branch") or f"hive/{(job_id or 'anon')[:8]}"
-            description = repo["stripped_description"] or description
+        try:
+            workspace = _prepare_workspace(job_id or "anon", repo, agent_alias=first_alias)
+        except Exception as exc:
+            return {
+                "exit_code": -1,
+                "error": f"workspace preparation failed: {type(exc).__name__}: {exc}",
+                "repo_url": repo["url"],
+                "providers_attempted": [],
+            }
+        branch = repo.get("branch") or f"hive/{(job_id or 'anon')[:8]}"
+        description = repo["stripped_description"] or description
     exec_cwd = workspace or WORKDIR
 
     tier = (max_cost_tier or "C").upper()
@@ -881,37 +948,35 @@ def run_zeroclaw(
             # is never handed to the job-controlled subprocess. Opt extra vars in via
             # ZC_AGENT_ENV_ALLOW.
             child_env = _build_agent_env()
-            proc = subprocess.Popen(
-                cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env
-            )
-            last_job_hb = time.time()
-            while True:
-                try:
-                    proc.wait(timeout=30)
-                    break
-                except subprocess.TimeoutExpired:
-                    elapsed = time.time() - start
-                    if elapsed >= timeout:
-                        proc.kill()
-                        proc.wait()
-                        if workspace:
-                            _cleanup_workspace(workspace)
-                        return {
-                            "exit_code": -1,
-                            "error": f"timeout {timeout}s exceeded (provider={agent_alias})",
-                            "duration_sec": round(elapsed, 1),
-                            "workdir": exec_cwd,
-                            "providers_attempted": providers_attempted,
-                        }
-                    if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
-                        try:
-                            job_heartbeat_fn(round(elapsed, 1))
-                        except Exception:
-                            pass
-                        last_job_hb = time.time()
-
-            last_stdout = proc.stdout.read()
-            last_stderr = proc.stderr.read()
+            with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+                proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=stdout_file, stderr=stderr_file, text=True, env=child_env)
+                last_job_hb = time.time()
+                while True:
+                    try:
+                        proc.wait(timeout=30)
+                        break
+                    except subprocess.TimeoutExpired:
+                        elapsed = time.time() - start
+                        if elapsed >= timeout:
+                            proc.kill()
+                            proc.wait()
+                            if workspace:
+                                _cleanup_workspace(workspace)
+                            return {
+                                "exit_code": -1,
+                                "error": f"timeout {timeout}s exceeded (provider={agent_alias})",
+                                "duration_sec": round(elapsed, 1),
+                                "workdir": exec_cwd,
+                                "providers_attempted": providers_attempted,
+                            }
+                        if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
+                            try:
+                                job_heartbeat_fn(round(elapsed, 1))
+                            except Exception:
+                                pass
+                            last_job_hb = time.time()
+                last_stdout = _read_output_tail(stdout_file, 12000)
+                last_stderr = _read_output_tail(stderr_file, 4000)
 
             # Success → break out of fallback loop
             if proc.returncode == 0:
@@ -952,6 +1017,7 @@ def run_zeroclaw(
         "duration_sec": round(time.time() - start, 1),
         "zeroclaw_cmd": f"{ZEROCLAW_BIN} agent -a {final_provider}",
         "agent_alias": final_provider,
+        "provider_used": _alias_to_provider(final_provider),
         "providers_attempted": providers_attempted,
         "tokens_in": t_in,
         "tokens_out": t_out,
@@ -962,6 +1028,7 @@ def run_zeroclaw(
         result["worker_error"] = err_tag
 
     # Post-agent: capture + commit/push changes if workspace exists
+    publication_failed = False
     try:
         if workspace and proc and proc.returncode == 0:
             changes = _capture_changes(workspace)
@@ -974,9 +1041,17 @@ def run_zeroclaw(
                 result["repo_url"] = repo["url"]
     except Exception as e:
         result["post_agent_error"] = f"{type(e).__name__}: {e}"
+        result["exit_code"] = 1
+        publication_failed = True
     finally:
         if workspace:
-            _cleanup_workspace(workspace)
+            if publication_failed:
+                try:
+                    result["workspace_preserved"] = _preserve_workspace(workspace, job_id or "anon")
+                except Exception as preserve_exc:
+                    result["workspace_preserve_error"] = f"{type(preserve_exc).__name__}: {preserve_exc}"
+            else:
+                _cleanup_workspace(workspace)
     return result
 
 
@@ -992,7 +1067,8 @@ def main():
             continue
         backoff = 1.0
         print(f"[zc-worker] claimed job {job['id'][:8]} kind={job['kind']} priority={job.get('priority')}", flush=True)
-        update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()})
+        if not update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()}, require_ack=True):
+            break
         job_id = job["id"]
 
         def _job_hb(elapsed):
@@ -1007,7 +1083,8 @@ def main():
         )
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
-        update_job(job["id"], status, result)
+        if not update_job(job["id"], status, result, require_ack=True):
+            break
         print(
             f"[zc-worker] {status} job {job['id'][:8]} exit={result.get('exit_code')} dur={result.get('duration_sec')}s",
             flush=True,

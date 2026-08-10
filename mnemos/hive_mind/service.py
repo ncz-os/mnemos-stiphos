@@ -325,6 +325,7 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "xai": "B",
     "deepseek": "B",
     "deepseek-direct": "B",
+    "siliconflow": "B",
     "together": "B",  # default — only MiniMax + cheap models; DO NOT default to Together DeepSeek-V4-Pro
     "gemini-flash": "B",
     "openai-mini": "B",
@@ -740,7 +741,10 @@ async def reaper_task(app: FastAPI):
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
+            app.state.reaper_last_success = time.time()
+            app.state.reaper_last_error = None
         except Exception as e:
+            app.state.reaper_last_error = f"{type(e).__name__}: {e}"
             print(f"reaper error: {e}", flush=True)
 
 
@@ -792,7 +796,10 @@ async def lifespan(app: FastAPI):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until)")
         await db.commit()
+    app.state.reaper_last_success = time.time()
+    app.state.reaper_last_error = None
     task = asyncio.create_task(reaper_task(app))
+    app.state.reaper_task = task
     yield
     task.cancel()
 
@@ -828,7 +835,37 @@ async def require_hive_bus_bearer(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
+    now = time.time()
+    problems: list[str] = []
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=1.0) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('agents','jobs','events')"
+            ) as cur:
+                row = await cur.fetchone()
+        if not row or row[0] != 3:
+            problems.append("storage schema is incomplete")
+    except Exception as exc:
+        problems.append(f"storage probe failed: {type(exc).__name__}: {exc}")
+
+    task = getattr(app.state, "reaper_task", None)
+    last_success = getattr(app.state, "reaper_last_success", None)
+    last_error = getattr(app.state, "reaper_last_error", None)
+    if task is None or task.done():
+        problems.append("reaper task is not running")
+    elif last_success is None or now - last_success > HEARTBEAT_REAP_INTERVAL * 2.5:
+        problems.append(f"reaper is stale: {last_error or 'no successful cycle'}")
+
+    payload = {
+        "status": "unhealthy" if problems else "healthy",
+        "ts": now,
+        "service": "graeae-hive-mind",
+        "version": "0.1.0",
+    }
+    if problems:
+        payload["problems"] = problems
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.get("/")
@@ -1283,6 +1320,28 @@ async def dequeue_next_job(agent_urn: str):
 @app.patch("/v1/jobs/{job_id}")
 async def update_job(job_id: str, req: JobUpdate):
     now = time.time()
+    reported_provider = None
+    reported_tier = None
+    if req.result and req.result.get("provider_used"):
+        reported_provider = str(req.result["provider_used"]).lower()
+        reported_tier = cost_tier_for(reported_provider)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT max_cost_tier FROM jobs WHERE id=?", (job_id,)) as cur:
+                cap_row = await cur.fetchone()
+        if cap_row and reported_tier not in COST_TIERS[: COST_TIERS.index(cap_row[0]) + 1]:
+            patched = dict(req.result)
+            patched["exit_code"] = 1
+            patched["failure_reason"] = (
+                f"cost_tier_violation: provider={reported_provider} tier={reported_tier} exceeds cap={cap_row[0]}"
+            )
+            req = JobUpdate(
+                status="failed",
+                result=patched,
+                claimed_by=req.claimed_by,
+                tokens_in=req.tokens_in,
+                tokens_out=req.tokens_out,
+                result_mnemos_id=req.result_mnemos_id,
+            )
     # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2 (per review 2026-05-23)
     halluc_reason = None
     if req.status == "done" and req.result:
@@ -1312,6 +1371,9 @@ async def update_job(job_id: str, req: JobUpdate):
     if req.claimed_by:
         fields.extend(["claimed_by=?", "claimed_at=?"])
         args.extend([req.claimed_by, now])
+    if reported_provider:
+        fields.extend(["claimed_provider=?", "claimed_cost_tier=?"])
+        args.extend([reported_provider, reported_tier])
     # token usage + cost estimation
     cost_estimate = None
     claimed_by_urn = None
@@ -1323,6 +1385,8 @@ async def update_job(job_id: str, req: JobUpdate):
                 row = await cur.fetchone()
         if row:
             prov, mod, claimed_by_urn = row
+            if reported_provider:
+                prov = reported_provider
             t_in = int(req.tokens_in or 0)
             t_out = int(req.tokens_out or 0)
             cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
@@ -1338,6 +1402,16 @@ async def update_job(job_id: str, req: JobUpdate):
                 "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
                 (cost_estimate, claimed_by_urn),
             )
+        attempt_jrow = None
+        if req.status in ("done", "failed", "cancelled"):
+            async with db.execute(
+                "SELECT kind, description, max_cost_tier, required_capabilities, "
+                "claimed_model, claimed_provider, claimed_by, result, started_at "
+                "FROM jobs WHERE id=?",
+                (job_id,),
+            ) as attempt_cur:
+                attempt_jrow = await attempt_cur.fetchone()
+
         # On failed: auto-retry if under max_retries. Exponential backoff: 30s × 2^retry_count
         if req.status == "failed":
             async with db.execute("SELECT retry_count, max_retries FROM jobs WHERE id=?", (job_id,)) as rcur:
@@ -1368,13 +1442,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 # fall through to stats roll-up below (count as fail for this attempt)
         # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring)
         if req.status in ("done", "failed", "cancelled"):
-            async with db.execute(
-                "SELECT kind, description, max_cost_tier, required_capabilities, "
-                "claimed_model, claimed_provider, claimed_by, result, started_at "
-                "FROM jobs WHERE id=?",
-                (job_id,),
-            ) as cur2:
-                jrow = await cur2.fetchone()
+            jrow = attempt_jrow
             if jrow:
                 kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
                 # capability scoring stats
