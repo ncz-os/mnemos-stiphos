@@ -29,6 +29,30 @@ def _knemon_router():
     return router_module.KnemonRouteRequest, router_module.route
 
 
+def _create_knemon_burn_reservation_schema(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE knemon_burn_sessions (
+          session_id TEXT PRIMARY KEY,
+          touched_at TEXT NOT NULL
+        );
+        CREATE TABLE knemon_burn_reservations (
+          reservation_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES knemon_burn_sessions(session_id),
+          reserved_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          request_count INTEGER NOT NULL DEFAULT 1 CHECK (request_count > 0),
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'reconciled', 'released')),
+          reconciled_at TEXT,
+          ledger_id INTEGER
+        );
+        CREATE INDEX idx_knemon_burn_reservations_active
+          ON knemon_burn_reservations (session_id, status, expires_at);
+        """
+    )
+
+
 def test_hive_service_register_create_and_claim_use_repository_contract(monkeypatch, tmp_path) -> None:
     db_path = str(tmp_path / "hive-service.sqlite3")
     monkeypatch.setattr(service, "DB_PATH", db_path)
@@ -371,6 +395,7 @@ async def test_registered_worker_subscription_pools_feed_knemon_routing(monkeypa
     now = datetime.now(timezone.utc)
     window_id = compute_plan_window_id("openai", "chatgpt_plus", now, reset_anchor="rolling", window_seconds=18000)
     with sqlite3.connect(db_path) as db:
+        _create_knemon_burn_reservation_schema(db)
         db.executescript(
             """
             CREATE TABLE model_registry (
@@ -522,6 +547,7 @@ async def test_subscription_pool_route_controls_provider_and_claimability(monkey
     now = datetime.now(timezone.utc)
     window_id = compute_plan_window_id("openai", "chatgpt_plus", now, reset_anchor="rolling", window_seconds=18000)
     with sqlite3.connect(db_path) as db:
+        _create_knemon_burn_reservation_schema(db)
         db.executescript(
             """
             CREATE TABLE model_registry (

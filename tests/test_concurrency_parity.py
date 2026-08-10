@@ -205,13 +205,12 @@ async def test_next_job_claims_are_concurrency_safe(repo_case: tuple[str, Any, s
 
 
 def test_oracle_claim_path_uses_skip_locked_and_rowcount_guard() -> None:
-    source = inspect.getsource(OracleHiveMindRepository._claim_next_job_sync)
+    source = inspect.getsource(OracleHiveMindRepository._claim_service_job_sync)
     compact = " ".join(source.upper().split())
 
     assert "FOR UPDATE SKIP LOCKED" in compact
-    assert "UPDATE MEMORY_JOBS" in compact
-    assert "AND STATUS = 'QUEUED'" in compact
+    assert "UPDATE JOBS" in compact
+    assert "AND STATUS IN ('QUEUED','OFFERED') AND CLAIMED_BY IS NULL" in compact
     assert "ROWCOUNT != 1" in compact
-    # Oracle's row-tuple compare claim path depends on the deployed P0-1
-    # rowcount fix: exactly one updated row is required before a claim is
-    # returned. Without it, SKIP LOCKED/isolation drift can hide duplicates.
+    # The service claim path requires exactly one guarded update before a claim
+    # is returned. Without it, SKIP LOCKED/isolation drift can hide duplicates.
