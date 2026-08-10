@@ -19,6 +19,30 @@ from mnemos.hive_mind.repository import HiveMindRepository
 
 
 UTC = dt.timezone.utc
+ORACLE_SCHEMA_COMPONENT = "stiphos-oracle"
+ORACLE_SCHEMA_VERSION = 2
+_CANONICAL_TABLES = {
+    "AGENTS",
+    "JOBS",
+    "HIVE_MESSAGES",
+    "HIVE_EVENTS",
+    "HIVE_CACHE",
+    "HIVE_WORKER_KIND_STATS",
+    "HIVE_SCHEMA_METADATA",
+}
+_LEGACY_TABLES = {"MEMORY_AGENTS", "MEMORY_JOBS", "MEMORY_MESSAGES", "MEMORY_EVENTS"}
+_ORACLE_JOB_SELECT_COLUMNS = (
+    "id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
+    "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, "
+    "preferred_models, mnemos_refs, depends_on, status, claimed_by, claimed_at, "
+    "claimed_runtime, claimed_model, claimed_provider, claimed_cost_tier, started_at, "
+    "retry_backoff_until, ended_at, result, result_mnemos_id, tokens_in, tokens_out, "
+    "estimated_cost_usd, retry_count, max_retries, routing_metadata"
+)
+
+
+class OracleSchemaCompatibilityError(RuntimeError):
+    """The connected schema is not the canonical STIPHOS Oracle schema."""
 
 
 def _json_dumps(value: Any) -> Optional[str]:
@@ -142,8 +166,44 @@ class OracleHiveMindRepository(HiveMindRepository):
         return cur
 
     async def init(self) -> None:
-        # TODO(Phase-2): migration application is handled by fleet-ops.
-        raise NotImplementedError("OracleHiveMindRepository.init is deferred to migration/fleet-ops.")
+        await self._run(self._validate_schema_sync)
+
+    def _validate_schema_sync(self) -> None:
+        migration = "migrations/oracle/002_memory_to_canonical.sql"
+        with self._pool.acquire() as conn:
+            cur = self._execute(
+                conn,
+                "SELECT table_name FROM user_tables WHERE table_name IN ("
+                + ",".join(f"'{name}'" for name in sorted(_CANONICAL_TABLES | _LEGACY_TABLES))
+                + ")",
+            )
+            found = {str(row[0]).upper() for row in cur.fetchall()}
+            legacy = sorted(found & _LEGACY_TABLES)
+            missing = sorted(_CANONICAL_TABLES - found)
+            if legacy:
+                raise OracleSchemaCompatibilityError(
+                    "Unsupported deprecated Oracle MEMORY_* schema detected "
+                    f"({', '.join(legacy)}). STIPHOS expects canonical AGENTS/JOBS and HIVE_* tables "
+                    f"at schema version {ORACLE_SCHEMA_VERSION}; apply {migration} before starting the service."
+                )
+            if missing:
+                raise OracleSchemaCompatibilityError(
+                    "Incomplete or unversioned Oracle schema detected; missing canonical tables: "
+                    f"{', '.join(missing)}. Apply mnemos/hive_mind/oracle_ddl.sql to a fresh schema "
+                    f"or {migration} to a deprecated MEMORY_* schema."
+                )
+            cur = self._execute(
+                conn,
+                "SELECT schema_version FROM hive_schema_metadata WHERE component = :component",
+                {"component": ORACLE_SCHEMA_COMPONENT},
+            )
+            row = cur.fetchone()
+            actual = int(row[0]) if row else None
+            if actual != ORACLE_SCHEMA_VERSION:
+                raise OracleSchemaCompatibilityError(
+                    f"Unsupported STIPHOS Oracle schema version {actual!r}; expected "
+                    f"{ORACLE_SCHEMA_VERSION}. Apply the required forward migration before starting the service."
+                )
 
     async def close(self) -> None:
         await self._run(self._pool.close)
@@ -172,7 +232,20 @@ class OracleHiveMindRepository(HiveMindRepository):
             urn=urn,
             kind=kind,
             host=host,
+            runtime=runtime,
+            model=model,
+            provider=provider,
+            cost_tier=cost_tier,
+            auth_method=auth_method,
+            autonomy_level=autonomy_level,
+            plan_cap_usd=None,
+            subscription_pools=None,
+            session_id="repository-register",
+            pid=pid,
             capabilities=capabilities,
+            version=version,
+            started_at=None,
+            metadata=metadata,
         )
 
     async def insert_agent(
@@ -202,8 +275,21 @@ class OracleHiveMindRepository(HiveMindRepository):
             urn=urn,
             kind=kind,
             host=host,
+            runtime=runtime,
+            model=model,
+            provider=provider,
+            cost_tier=cost_tier,
+            auth_method=auth_method,
+            autonomy_level=autonomy_level,
+            plan_cap_usd=plan_cap_usd,
+            subscription_pools=subscription_pools,
+            session_id=session_id,
+            pid=pid,
             capabilities=capabilities,
-            last_heartbeat=_ts_to_dt(last_heartbeat),
+            version=version,
+            started_at=_ts_to_tstz(started_at),
+            last_heartbeat=_ts_to_tstz(last_heartbeat),
+            metadata=metadata,
         )
 
     def _register_agent_sync(
@@ -212,41 +298,71 @@ class OracleHiveMindRepository(HiveMindRepository):
         urn: str,
         kind: str,
         host: str,
+        runtime: Optional[str],
+        model: Optional[str],
+        provider: Optional[str],
+        cost_tier: Optional[str],
+        auth_method: Optional[str],
+        autonomy_level: Optional[str],
+        plan_cap_usd: Optional[float],
+        subscription_pools: Optional[list[str]],
+        session_id: str,
+        pid: Optional[int],
         capabilities: Optional[list[str]],
+        version: Optional[str],
+        started_at: Optional[dt.datetime],
         last_heartbeat: Optional[dt.datetime] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         with self._pool.acquire() as conn:
             self._execute(
                 conn,
                 """
-                MERGE INTO memory_agents dst
+                MERGE INTO agents dst
                 USING (
-                  SELECT :agent_urn AS agent_urn,
-                         :kind AS kind,
-                         :host AS host,
-                         :last_heartbeat AS last_heartbeat,
-                         :capabilities AS capabilities
-                  FROM dual
+                  SELECT :urn AS urn FROM dual
                 ) src
-                ON (dst.agent_urn = src.agent_urn)
+                ON (dst.urn = src.urn)
                 WHEN MATCHED THEN UPDATE SET
-                  dst.kind = src.kind,
-                  dst.host = src.host,
-                  dst.last_heartbeat = COALESCE(src.last_heartbeat, SYSTIMESTAMP),
-                  dst.capabilities = src.capabilities
+                  dst.kind=:kind, dst.host=:host, dst.runtime=:runtime,
+                  dst.model=:model, dst.provider=:provider, dst.cost_tier=:cost_tier,
+                  dst.auth_method=COALESCE(:auth_method,'unknown'),
+                  dst.autonomy_level=:autonomy_level, dst.plan_cap_usd=:plan_cap_usd,
+                  dst.subscription_pools=:subscription_pools, dst.session_id=:session_id,
+                  dst.pid=:pid, dst.capabilities=:capabilities, dst.version=:version,
+                  dst.last_heartbeat=COALESCE(:last_heartbeat,SYSTIMESTAMP),
+                  dst.status='online', dst.metadata=:metadata
                 WHEN NOT MATCHED THEN INSERT (
-                  agent_urn, kind, host, registered_at, last_heartbeat, capabilities
+                  urn, kind, host, runtime, model, provider, cost_tier, auth_method,
+                  autonomy_level, plan_cap_usd, subscription_pools, session_id, pid,
+                  capabilities, version, started_at, last_heartbeat, status, metadata
                 ) VALUES (
-                  src.agent_urn, src.kind, src.host, SYSTIMESTAMP,
-                  COALESCE(src.last_heartbeat, SYSTIMESTAMP), src.capabilities
+                  :urn, :kind, :host, :runtime, :model, :provider, :cost_tier,
+                  COALESCE(:auth_method,'unknown'), :autonomy_level, :plan_cap_usd,
+                  :subscription_pools, :session_id, :pid, :capabilities, :version,
+                  COALESCE(:started_at,SYSTIMESTAMP), COALESCE(:last_heartbeat,SYSTIMESTAMP),
+                  'online', :metadata
                 )
                 """,
                 {
-                    "agent_urn": urn,
+                    "urn": urn,
                     "kind": kind,
                     "host": host,
+                    "runtime": runtime,
+                    "model": model,
+                    "provider": provider,
+                    "cost_tier": cost_tier,
+                    "auth_method": auth_method,
+                    "autonomy_level": autonomy_level,
+                    "plan_cap_usd": plan_cap_usd,
+                    "subscription_pools": _json_dumps(subscription_pools),
+                    "session_id": session_id,
+                    "pid": pid,
                     "last_heartbeat": last_heartbeat,
                     "capabilities": _json_dumps(capabilities),
+                    "version": version,
+                    "started_at": started_at,
+                    "metadata": _json_dumps(metadata),
                 },
             )
             conn.commit()
@@ -262,11 +378,11 @@ class OracleHiveMindRepository(HiveMindRepository):
             cur = self._execute(
                 conn,
                 """
-                UPDATE memory_agents
+                UPDATE agents
                 SET last_heartbeat = COALESCE(:last_heartbeat, SYSTIMESTAMP)
-                WHERE agent_urn = :agent_urn
+                WHERE urn = :urn
                 """,
-                {"agent_urn": urn, "last_heartbeat": heartbeat_at},
+                {"urn": urn, "last_heartbeat": heartbeat_at},
             )
             conn.commit()
             return cur.rowcount > 0
@@ -279,12 +395,10 @@ class OracleHiveMindRepository(HiveMindRepository):
             cur = self._execute(
                 conn,
                 """
-                SELECT agent_urn, kind, host, registered_at, last_heartbeat,
-                       capabilities
-                FROM memory_agents
-                WHERE agent_urn = :agent_urn
+                SELECT urn, kind, host, started_at, last_heartbeat, capabilities
+                FROM agents WHERE urn = :urn
                 """,
-                {"agent_urn": urn},
+                {"urn": urn},
             )
             row = cur.fetchone()
             if not row:
@@ -308,6 +422,7 @@ class OracleHiveMindRepository(HiveMindRepository):
     ) -> list[dict[str, Any]]:
         return await self._run(
             self._list_agents_sync,
+            status=status,
             kind=kind,
             host=host,
             limit=limit,
@@ -316,14 +431,18 @@ class OracleHiveMindRepository(HiveMindRepository):
     def _list_agents_sync(
         self,
         *,
+        status: Optional[str],
         kind: Optional[str],
         host: Optional[str],
         limit: int,
     ) -> list[dict[str, Any]]:
         sql = (
-            "SELECT agent_urn, kind, host, registered_at, last_heartbeat, capabilities " "FROM memory_agents WHERE 1=1"
+            "SELECT urn, kind, host, started_at, last_heartbeat, capabilities FROM agents WHERE 1=1"
         )
         params: dict[str, Any] = {"limit": int(limit)}
+        if status:
+            sql += " AND status = :status"
+            params["status"] = status
         if kind:
             sql += " AND kind = :kind"
             params["kind"] = kind
@@ -367,8 +486,10 @@ class OracleHiveMindRepository(HiveMindRepository):
         depends_on: Optional[list[str]],
         max_retries: int,
         started_at: float,
+        routing_metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        await self.insert_job(
+        await self._run(
+            self._insert_service_job_sync,
             job_id=job_id,
             submitter_urn=submitter_urn,
             parent_job_id=parent_job_id,
@@ -377,9 +498,22 @@ class OracleHiveMindRepository(HiveMindRepository):
             priority=priority,
             eligible_kinds=eligible_kinds,
             project=project,
-            tags={"mnemos_refs": mnemos_refs, "depends_on": depends_on},
+            deadline=deadline,
+            required_capabilities=required_capabilities,
+            max_cost_tier=max_cost_tier,
+            preferred_providers=preferred_providers,
+            preferred_models=preferred_models,
+            mnemos_refs=mnemos_refs,
+            depends_on=depends_on,
+            routing_metadata=routing_metadata,
             max_retries=max_retries,
-            created_at=started_at,
+            status="queued",
+            started_at=started_at,
+            ended_at=None,
+            result=None,
+            result_mnemos_id=None,
+            claimed_model=None,
+            claimed_provider=None,
         )
 
     async def insert_job_queued(self, **kwargs: Any) -> None:
@@ -400,24 +534,33 @@ class OracleHiveMindRepository(HiveMindRepository):
         max_retries: int = 3,
         created_at: Optional[float] = None,
     ) -> None:
+        tags_dict = tags if isinstance(tags, dict) else {}
         await self._run(
-            self._insert_job_sync,
+            self._insert_service_job_sync,
             job_id=job_id,
             submitter_urn=submitter_urn,
             parent_job_id=parent_job_id,
             kind=kind,
             description=description,
             priority=priority,
-            status="queued",
+            deadline=None,
+            required_capabilities=None,
             eligible_kinds=eligible_kinds,
             project=project,
-            tags=tags,
+            max_cost_tier=str(tags_dict.get("max_cost_tier") or "A"),
+            preferred_providers=tags_dict.get("preferred_providers"),
+            preferred_models=tags_dict.get("preferred_models"),
+            mnemos_refs=tags_dict.get("mnemos_refs"),
+            depends_on=tags_dict.get("depends_on"),
+            routing_metadata=None,
             max_retries=max_retries,
-            created_at=_ts_to_dt(created_at),
-            started_at=None,
+            status="queued",
+            started_at=created_at,
             ended_at=None,
             result=None,
-            claimed_by=None,
+            result_mnemos_id=None,
+            claimed_model=None,
+            claimed_provider=None,
         )
 
     async def insert_job_cache_hit(
@@ -444,36 +587,35 @@ class OracleHiveMindRepository(HiveMindRepository):
         model: Optional[str] = None,
         result_mnemos_id: Optional[str] = None,
     ) -> None:
-        tags = {
-            "max_cost_tier": max_cost_tier,
-            "preferred_providers": preferred_providers,
-            "preferred_models": preferred_models,
-            "mnemos_refs": mnemos_refs,
-            "provider": provider,
-            "model": model,
-            "result_mnemos_id": result_mnemos_id,
-        }
         await self._run(
-            self._insert_job_sync,
+            self._insert_service_job_sync,
             job_id=job_id,
             submitter_urn=submitter_urn,
             parent_job_id=parent_job_id,
             kind=kind,
             description=description,
             priority=priority,
+            deadline=deadline,
+            required_capabilities=required_capabilities,
             status="done",
             eligible_kinds=eligible_kinds,
             project=project,
-            tags=tags,
+            max_cost_tier=max_cost_tier,
+            preferred_providers=preferred_providers,
+            preferred_models=preferred_models,
+            mnemos_refs=mnemos_refs,
+            depends_on=None,
+            routing_metadata=None,
             max_retries=0,
-            created_at=_ts_to_dt(started_at),
-            started_at=_ts_to_dt(started_at),
-            ended_at=_ts_to_dt(ended_at),
+            started_at=started_at,
+            ended_at=ended_at,
             result=result,
-            claimed_by=None,
+            result_mnemos_id=result_mnemos_id,
+            claimed_model=model,
+            claimed_provider=provider,
         )
 
-    def _insert_job_sync(
+    def _insert_service_job_sync(
         self,
         *,
         job_id: str,
@@ -482,30 +624,43 @@ class OracleHiveMindRepository(HiveMindRepository):
         kind: str,
         description: Optional[str],
         priority: int,
+        deadline: Optional[float],
+        required_capabilities: Optional[list[str]],
         status: str,
         eligible_kinds: Optional[list[str]],
         project: Optional[str],
-        tags: Any,
+        max_cost_tier: str,
+        preferred_providers: Optional[list[str]],
+        preferred_models: Optional[list[str]],
+        mnemos_refs: Optional[list[str]],
+        depends_on: Optional[list[str]],
+        routing_metadata: Optional[dict[str, Any]],
         max_retries: int,
-        created_at: Optional[dt.datetime],
-        started_at: Optional[dt.datetime],
-        ended_at: Optional[dt.datetime],
+        started_at: Optional[float],
+        ended_at: Optional[float],
         result: Optional[dict[str, Any]],
-        claimed_by: Optional[str],
+        result_mnemos_id: Optional[str],
+        claimed_model: Optional[str],
+        claimed_provider: Optional[str],
     ) -> None:
         with self._pool.acquire() as conn:
             self._execute(
                 conn,
                 """
-                INSERT INTO memory_jobs (
-                  id, status, priority, kind, description, submitter_urn,
-                  claimed_by, parent_job_id, created_at, started_at, ended_at,
-                  result, eligible_kinds, project, tags, retry_count, max_retries
+                INSERT INTO jobs (
+                  id, submitter_urn, parent_job_id, kind, description, priority,
+                  deadline, required_capabilities, eligible_kinds, project,
+                  max_cost_tier, preferred_providers, preferred_models, mnemos_refs,
+                  depends_on, status, claimed_model, claimed_provider, started_at,
+                  ended_at, result, result_mnemos_id, retry_count, max_retries,
+                  routing_metadata
                 ) VALUES (
-                  :id, :status, :priority, :kind, :description, :submitter_urn,
-                  :claimed_by, :parent_job_id, COALESCE(:created_at, SYSTIMESTAMP),
-                  :started_at, :ended_at, :result, :eligible_kinds, :project,
-                  :tags, 0, :max_retries
+                  :id, :submitter_urn, :parent_job_id, :kind, :description, :priority,
+                  :deadline, :required_capabilities, :eligible_kinds, :project,
+                  :max_cost_tier, :preferred_providers, :preferred_models, :mnemos_refs,
+                  :depends_on, :status, :claimed_model, :claimed_provider,
+                  COALESCE(:started_at,SYSTIMESTAMP), :ended_at, :result,
+                  :result_mnemos_id, 0, :max_retries, :routing_metadata
                 )
                 """,
                 {
@@ -515,15 +670,23 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "kind": kind,
                     "description": description,
                     "submitter_urn": submitter_urn,
-                    "claimed_by": claimed_by,
                     "parent_job_id": _uuid_to_raw(parent_job_id),
-                    "created_at": created_at,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
+                    "deadline": _ts_to_tstz(deadline),
+                    "required_capabilities": _json_dumps(required_capabilities),
+                    "started_at": _ts_to_tstz(started_at),
+                    "ended_at": _ts_to_tstz(ended_at),
                     "result": _json_dumps(result),
                     "eligible_kinds": _json_dumps(eligible_kinds),
                     "project": project,
-                    "tags": _json_dumps(tags),
+                    "max_cost_tier": str(max_cost_tier or "A").upper(),
+                    "preferred_providers": _json_dumps(preferred_providers),
+                    "preferred_models": _json_dumps(preferred_models),
+                    "mnemos_refs": _json_dumps(mnemos_refs),
+                    "depends_on": _json_dumps(depends_on),
+                    "routing_metadata": _json_dumps(routing_metadata),
+                    "result_mnemos_id": result_mnemos_id,
+                    "claimed_model": claimed_model,
+                    "claimed_provider": claimed_provider,
                     "max_retries": int(max_retries),
                 },
             )
@@ -537,10 +700,17 @@ class OracleHiveMindRepository(HiveMindRepository):
         agent_capabilities: Optional[list[str]] = None,
         agent_cost_tier: str = "A",
     ) -> Optional[dict[str, Any]]:
-        return await self._run(
-            self._claim_next_job_sync,
+        return await self.find_and_claim_job(
             agent_urn=agent_urn,
             agent_kind=agent_kind,
+            agent_caps=set(agent_capabilities or []),
+            agent_runtime="unknown",
+            agent_model="unknown",
+            agent_provider="unknown",
+            agent_tier=agent_cost_tier,
+            cost_tier_order=["A", "B", "C"],
+            sub_throttled=False,
+            now=time.time(),
         )
 
     async def find_and_claim_job(
@@ -557,86 +727,260 @@ class OracleHiveMindRepository(HiveMindRepository):
         sub_throttled: bool,
         now: float,
     ) -> Optional[dict[str, Any]]:
-        claimed = await self.claim_next_job(
+        return await self._run(
+            self._claim_service_job_sync,
+            job_id=None,
             agent_urn=agent_urn,
             agent_kind=agent_kind,
-            agent_capabilities=list(agent_caps),
-            agent_cost_tier=agent_tier,
+            agent_caps=set(agent_caps),
+            agent_runtime=agent_runtime,
+            agent_model=agent_model,
+            agent_provider=agent_provider,
+            agent_tier=agent_tier,
+            cost_tier_order=list(cost_tier_order),
+            sub_throttled=sub_throttled,
+            now=now,
         )
-        if claimed:
-            claimed["claimed_resources"] = {
-                "runtime": agent_runtime,
-                "model": agent_model,
-                "provider": agent_provider,
-                "cost_tier": agent_tier,
-            }
-        return claimed
 
-    def _claim_next_job_sync(
+    async def claim_job_by_id(
         self,
         *,
+        job_id: str,
         agent_urn: str,
         agent_kind: str,
-    ) -> Optional[dict[str, Any]]:
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        claimed = await self._run(
+            self._claim_service_job_sync,
+            job_id=job_id,
+            agent_urn=agent_urn,
+            agent_kind=agent_kind,
+            agent_caps=set(agent_caps),
+            agent_runtime=agent_runtime,
+            agent_model=agent_model,
+            agent_provider=agent_provider,
+            agent_tier=agent_tier,
+            cost_tier_order=list(cost_tier_order),
+            sub_throttled=sub_throttled,
+            now=now,
+        )
+        if claimed is None:
+            return ("unavailable", None)
+        if claimed is False:
+            return ("ineligible", None)
+        return ("claimed", claimed)
+
+    def _claim_service_job_sync(
+        self,
+        *,
+        job_id: Optional[str],
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> Optional[dict[str, Any]] | bool:
         with self._pool.acquire() as conn:
             try:
                 cur = conn.cursor()
+                where = "status IN ('queued','offered') AND claimed_by IS NULL AND (retry_backoff_until IS NULL OR retry_backoff_until <= :now)"
+                params: dict[str, Any] = {"now": _ts_to_tstz(now)}
+                if job_id is not None:
+                    where += " AND id = :id"
+                    params["id"] = _uuid_to_raw(job_id)
                 cur.execute(
-                    """
-                    SELECT id, kind, description, priority, submitter_urn,
-                           parent_job_id, created_at, eligible_kinds, project, tags
-                    FROM memory_jobs
-                    WHERE status = 'queued'
-                    ORDER BY priority DESC, created_at ASC
-                    FOR UPDATE SKIP LOCKED
-                    """
+                    f"SELECT {_ORACLE_JOB_SELECT_COLUMNS} FROM jobs WHERE {where} "
+                    "ORDER BY priority DESC, started_at ASC FOR UPDATE SKIP LOCKED",
+                    params,
                 )
                 for row in cur:
-                    eligible = _json_loads(row[7], None)
-                    if eligible and agent_kind not in eligible:
+                    if not self._service_job_is_claimable(
+                        conn,
+                        row=row,
+                        agent_urn=agent_urn,
+                        agent_kind=agent_kind,
+                        agent_caps=agent_caps,
+                        agent_model=agent_model,
+                        agent_provider=agent_provider,
+                        agent_tier=agent_tier,
+                        cost_tier_order=cost_tier_order,
+                        sub_throttled=sub_throttled,
+                    ):
+                        if job_id is not None:
+                            conn.rollback()
+                            return False
                         continue
-                    job_id = row[0]
                     update_cur = self._execute(
                         conn,
                         """
-                        UPDATE memory_jobs
-                        SET status = 'claimed',
-                            claimed_by = :claimed_by,
-                            started_at = SYSTIMESTAMP
+                        UPDATE jobs SET status='claimed', claimed_by=:claimed_by,
+                            claimed_at=:claimed_at, claimed_runtime=:claimed_runtime,
+                            claimed_model=:claimed_model, claimed_provider=:claimed_provider,
+                            claimed_cost_tier=:claimed_cost_tier
                         WHERE id = :id
-                          AND status = 'queued'
+                          AND status IN ('queued','offered') AND claimed_by IS NULL
                         """,
-                        {"claimed_by": agent_urn, "id": job_id},
+                        {
+                            "claimed_by": agent_urn,
+                            "claimed_at": _ts_to_tstz(now),
+                            "claimed_runtime": agent_runtime,
+                            "claimed_model": agent_model,
+                            "claimed_provider": agent_provider,
+                            "claimed_cost_tier": agent_tier,
+                            "id": row[0],
+                        },
                     )
                     if update_cur.rowcount != 1:
                         continue
                     conn.commit()
-                    return self._job_from_row(
-                        (
-                            row[0],
-                            "claimed",
-                            row[3],
-                            row[1],
-                            row[2],
-                            row[4],
-                            agent_urn,
-                            row[5],
-                            row[6],
-                            dt.datetime.now(),
-                            None,
-                            None,
-                            row[7],
-                            row[8],
-                            row[9],
-                            0,
-                            3,
-                        )
-                    )
+                    claimed_row = list(row)
+                    claimed_row[15] = "claimed"
+                    claimed_row[16] = agent_urn
+                    claimed_row[17] = _ts_to_tstz(now)
+                    claimed_row[18] = agent_runtime
+                    claimed_row[19] = agent_model
+                    claimed_row[20] = agent_provider
+                    claimed_row[21] = agent_tier
+                    claimed = self._job_from_row(claimed_row)
+                    claimed["claimed_resources"] = {
+                        "runtime": agent_runtime,
+                        "model": agent_model,
+                        "provider": agent_provider,
+                        "cost_tier": agent_tier,
+                    }
+                    return claimed
                 conn.rollback()
                 return None
             except Exception:
                 conn.rollback()
                 raise
+
+    @staticmethod
+    def _normalized_strings(value: Any) -> set[str]:
+        loaded = _json_loads(value, value) if isinstance(value, (str, bytes)) else value
+        if not loaded:
+            return set()
+        items = loaded.keys() if isinstance(loaded, dict) else loaded if isinstance(loaded, (list, tuple, set)) else [loaded]
+        return {
+            "".join(ch if ch.isalnum() else "_" for ch in str(item).strip().lower()).strip("_")
+            for item in items
+            if str(item).strip()
+        }
+
+    def _service_job_is_claimable(
+        self,
+        conn: Any,
+        *,
+        row: Any,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+    ) -> bool:
+        if not set(_json_loads(row[7], []) or []).issubset(agent_caps):
+            return False
+        eligible = _json_loads(row[8], None)
+        if eligible and agent_kind not in set(eligible):
+            return False
+        providers = {str(v).lower() for v in (_json_loads(row[11], []) or [])}
+        if providers and agent_provider.lower() not in providers:
+            return False
+        models = {str(v).lower() for v in (_json_loads(row[12], []) or [])}
+        if models and agent_model.lower() not in models:
+            return False
+        routing = _json_loads(row[32], {}) or {}
+        required_pools = self._normalized_strings(routing.get("required_subscription_pools"))
+        if required_pools:
+            cur = self._execute(
+                conn,
+                "SELECT subscription_pools FROM agents WHERE urn=:urn AND status IN ('online','idle')",
+                {"urn": agent_urn},
+            )
+            agent_row = cur.fetchone()
+            if not required_pools.intersection(self._normalized_strings(agent_row[0] if agent_row else None)):
+                return False
+        if sub_throttled and str(row[10] or "A").upper() != "A":
+            return False
+        try:
+            if cost_tier_order.index(str(agent_tier or "C").upper()) > cost_tier_order.index(str(row[10] or "A").upper()):
+                return False
+        except ValueError:
+            return False
+        for dependency in _json_loads(row[14], []) or []:
+            cur = self._execute(conn, "SELECT status FROM jobs WHERE id=:id", {"id": _uuid_to_raw(dependency)})
+            dep = cur.fetchone()
+            if not dep or dep[0] != "done":
+                return False
+        return True
+
+    async def update_job_routing(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool:
+        return await self._run(self._update_job_routing_sync, job_id=job_id, routed_at=routed_at, **kwargs)
+
+    def _update_job_routing_sync(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool:
+        with self._pool.acquire() as conn:
+            cur = self._execute(
+                conn,
+                "SELECT max_cost_tier, routing_metadata FROM jobs "
+                "WHERE id=:id AND status='queued' AND claimed_by IS NULL FOR UPDATE",
+                {"id": _uuid_to_raw(job_id)},
+            )
+            existing = cur.fetchone()
+            if not existing:
+                conn.rollback()
+                return False
+            requested_tier = kwargs.get("max_cost_tier")
+            metadata = _json_loads(existing[1], {}) or {}
+            if requested_tier is not None and metadata.get("submitter_max_cost_tier_explicit"):
+                order = ["A", "B", "C"]
+                try:
+                    if order.index(str(requested_tier).upper()) > order.index(str(existing[0] or "A").upper()):
+                        requested_tier = existing[0]
+                except ValueError:
+                    requested_tier = existing[0]
+            fields = ["routed_at=:routed_at", "routing_metadata=:routing_metadata"]
+            params: dict[str, Any] = {
+                "id": _uuid_to_raw(job_id),
+                "routed_at": _ts_to_tstz(routed_at),
+                "routing_metadata": _json_dumps(kwargs.get("routing_metadata") or {}),
+            }
+            for column in (
+                "required_capabilities",
+                "eligible_kinds",
+                "preferred_providers",
+                "preferred_models",
+                "mnemos_refs",
+                "depends_on",
+            ):
+                if kwargs.get(column) is not None:
+                    fields.append(f"{column}=:{column}")
+                    params[column] = _json_dumps(kwargs[column])
+            if requested_tier is not None:
+                fields.append("max_cost_tier=:max_cost_tier")
+                params["max_cost_tier"] = str(requested_tier).upper()
+            cur = self._execute(
+                conn,
+                f"UPDATE jobs SET {', '.join(fields)} "
+                "WHERE id=:id AND status='queued' AND claimed_by IS NULL",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount == 1
 
     async def update_job(
         self,
@@ -655,7 +999,11 @@ class OracleHiveMindRepository(HiveMindRepository):
             job_id=job_id,
             status=status,
             result=result,
-            ended_at=_ts_to_dt(ended_at),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            result_mnemos_id=result_mnemos_id,
+            ended_at=_ts_to_tstz(ended_at),
+            estimated_cost_usd=estimated_cost_usd,
         )
 
     def _update_job_sync(
@@ -664,15 +1012,23 @@ class OracleHiveMindRepository(HiveMindRepository):
         job_id: str,
         status: str,
         result: Optional[dict[str, Any]],
+        tokens_in: Optional[int],
+        tokens_out: Optional[int],
+        result_mnemos_id: Optional[str],
         ended_at: Optional[dt.datetime],
+        estimated_cost_usd: Optional[float],
     ) -> None:
         with self._pool.acquire() as conn:
             cur = self._execute(
                 conn,
                 """
-                UPDATE memory_jobs
+                UPDATE jobs
                 SET status = :status,
                     result = COALESCE(:result, result),
+                    tokens_in = COALESCE(:tokens_in, tokens_in),
+                    tokens_out = COALESCE(:tokens_out, tokens_out),
+                    result_mnemos_id = COALESCE(:result_mnemos_id, result_mnemos_id),
+                    estimated_cost_usd = COALESCE(:estimated_cost_usd, estimated_cost_usd),
                     ended_at = CASE
                       WHEN :ended_at IS NOT NULL THEN :ended_at
                       WHEN :status IN ('done', 'failed', 'cancelled') THEN SYSTIMESTAMP
@@ -684,7 +1040,11 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "id": _uuid_to_raw(job_id),
                     "status": status,
                     "result": _json_dumps(result),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "result_mnemos_id": result_mnemos_id,
                     "ended_at": ended_at,
+                    "estimated_cost_usd": estimated_cost_usd,
                 },
             )
             conn.commit()
@@ -699,11 +1059,8 @@ class OracleHiveMindRepository(HiveMindRepository):
             cur = self._execute(
                 conn,
                 """
-                SELECT id, status, priority, kind, description, submitter_urn,
-                       claimed_by, parent_job_id, created_at, started_at,
-                       ended_at, result, eligible_kinds, project, tags,
-                       retry_count, max_retries
-                FROM memory_jobs
+                SELECT """ + _ORACLE_JOB_SELECT_COLUMNS + """
+                FROM jobs
                 WHERE id = :id
                 """,
                 {"id": _uuid_to_raw(job_id)},
@@ -742,10 +1099,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         limit: int,
     ) -> list[dict[str, Any]]:
         sql = (
-            "SELECT id, status, priority, kind, description, submitter_urn, "
-            "claimed_by, parent_job_id, created_at, started_at, ended_at, result, "
-            "eligible_kinds, project, tags, retry_count, max_retries "
-            "FROM memory_jobs WHERE 1=1"
+            "SELECT " + _ORACLE_JOB_SELECT_COLUMNS + " FROM jobs WHERE 1=1"
         )
         params: dict[str, Any] = {"limit": int(limit)}
         for name, value in {
@@ -758,7 +1112,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             if value:
                 sql += f" AND {name} = :{name}"
                 params[name] = value
-        sql += " ORDER BY priority DESC, created_at DESC FETCH FIRST :limit ROWS ONLY"
+        sql += " ORDER BY priority DESC, started_at DESC FETCH FIRST :limit ROWS ONLY"
         with self._pool.acquire() as conn:
             cur = self._execute(conn, sql, params)
             return [self._job_from_row(r) for r in cur.fetchall()]
@@ -766,24 +1120,40 @@ class OracleHiveMindRepository(HiveMindRepository):
     def _job_from_row(self, row: Any) -> dict[str, Any]:
         return {
             "id": _raw_to_uuid(row[0]),
-            "status": row[1],
-            "priority": row[2],
+            "submitter_urn": row[1],
+            "parent_job_id": _raw_to_uuid(row[2]),
             "kind": row[3],
             "description": row[4],
-            "submitter_urn": row[5],
-            "claimed_by": row[6],
-            "parent_job_id": _raw_to_uuid(row[7]),
-            "created_at": _dt_to_ts(row[8]),
-            "queued_at": _dt_to_ts(row[8]),
-            "started_at": _dt_to_ts(row[9]),
-            "claimed_at": _dt_to_ts(row[9]),
-            "ended_at": _dt_to_ts(row[10]),
-            "result": _json_loads(row[11], None),
-            "eligible_kinds": _json_loads(row[12], None),
-            "project": row[13],
-            "tags": _json_loads(row[14], None),
-            "retry_count": row[15],
-            "max_retries": row[16],
+            "priority": row[5],
+            "deadline": _dt_to_ts(row[6]),
+            "required_capabilities": _json_loads(row[7], None),
+            "eligible_kinds": _json_loads(row[8], None),
+            "project": row[9],
+            "max_cost_tier": row[10],
+            "preferred_providers": _json_loads(row[11], None),
+            "preferred_models": _json_loads(row[12], None),
+            "mnemos_refs": _json_loads(row[13], None),
+            "depends_on": _json_loads(row[14], None),
+            "status": row[15],
+            "claimed_by": row[16],
+            "claimed_at": _dt_to_ts(row[17]),
+            "claimed_runtime": row[18],
+            "claimed_model": row[19],
+            "claimed_provider": row[20],
+            "claimed_cost_tier": row[21],
+            "started_at": _dt_to_ts(row[22]),
+            "created_at": _dt_to_ts(row[22]),
+            "queued_at": _dt_to_ts(row[22]),
+            "retry_backoff_until": _dt_to_ts(row[23]),
+            "ended_at": _dt_to_ts(row[24]),
+            "result": _json_loads(row[25], None),
+            "result_mnemos_id": row[26],
+            "tokens_in": row[27],
+            "tokens_out": row[28],
+            "estimated_cost_usd": float(row[29]) if row[29] is not None else None,
+            "retry_count": row[30],
+            "max_retries": row[31],
+            "routing_metadata": _json_loads(row[32], None),
         }
 
     # ---------- cache + stats ----------
@@ -796,25 +1166,8 @@ class OracleHiveMindRepository(HiveMindRepository):
         return value if isinstance(value, dict) else {"value": value} if value is not None else None
 
     def _get_cache_sync(self, cache_key: str) -> Optional[Any]:
-        with self._pool.acquire() as conn:
-            cur = self._execute(
-                conn,
-                """
-                SELECT value
-                FROM memory_hive_cache
-                WHERE cache_key = :cache_key
-                  AND (expires_at IS NULL OR expires_at > SYSTIMESTAMP)
-                """,
-                {"cache_key": cache_key},
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            raw = _read_lob(row[0])
-            try:
-                return _json_loads(raw, None)
-            except json.JSONDecodeError:
-                return raw
+        cached = self._cache_get_sync(cache_key)
+        return cached["result"] if cached else None
 
     async def set_cache(
         self,
@@ -874,7 +1227,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                 return None
             return {
                 "result": _json_loads(row[0], None),
-                "source_job_id": row[1],
+                "source_job_id": _raw_to_uuid(row[1]) if row[1] is not None else None,
                 "result_mnemos_id": row[2],
                 "hit_count": row[3],
                 "cost_saved_usd": float(row[4] or 0),
@@ -929,11 +1282,11 @@ class OracleHiveMindRepository(HiveMindRepository):
                 {
                     "cache_key": cache_key,
                     "result_json": _json_dumps(result_json or {}),
-                    "source_job_id": source_job_id,
+                    "source_job_id": _uuid_to_raw(source_job_id) if source_job_id else None,
                     "result_mnemos_id": result_mnemos_id,
                     "model": model,
                     "provider": provider,
-                    "cached_at": float(cached_at if cached_at is not None else time.time()),
+                    "cached_at": _ts_to_tstz(cached_at if cached_at is not None else time.time()),
                 },
             )
             conn.commit()
@@ -949,27 +1302,25 @@ class OracleHiveMindRepository(HiveMindRepository):
             self._execute(
                 conn,
                 """
-                MERGE INTO memory_hive_cache dst
+                MERGE INTO hive_cache dst
                 USING (
                   SELECT :cache_key AS cache_key,
-                         :value AS value,
-                         :expires_at AS expires_at
+                         :result_json AS result_json
                   FROM dual
                 ) src
                 ON (dst.cache_key = src.cache_key)
                 WHEN MATCHED THEN UPDATE SET
-                  dst.value = src.value,
-                  dst.expires_at = src.expires_at
+                  dst.result_json = src.result_json,
+                  dst.cached_at = SYSTIMESTAMP
                 WHEN NOT MATCHED THEN INSERT (
-                  cache_key, value, expires_at, created_at
+                  cache_key, result_json, cached_at
                 ) VALUES (
-                  src.cache_key, src.value, src.expires_at, SYSTIMESTAMP
+                  src.cache_key, src.result_json, SYSTIMESTAMP
                 )
                 """,
                 {
                     "cache_key": cache_key,
-                    "value": value if isinstance(value, str) else _json_dumps(value),
-                    "expires_at": expires_at,
+                    "result_json": _json_dumps(value),
                 },
             )
             conn.commit()
@@ -1017,7 +1368,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             self._execute(
                 conn,
                 """
-                MERGE INTO memory_worker_kind_stats dst
+                MERGE INTO hive_worker_kind_stats dst
                 USING (
                   SELECT :kind AS kind,
                          :success_count AS success_count,
@@ -1029,7 +1380,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                          :duration_sec AS total_duration_sec
                   FROM dual
                 ) src
-                ON (dst.kind = src.kind)
+                ON (dst.urn = 'aggregate' AND dst.kind = src.kind)
                 WHEN MATCHED THEN UPDATE SET
                   dst.success_count = dst.success_count + src.success_count,
                   dst.fail_count = dst.fail_count + src.fail_count,
@@ -1040,11 +1391,11 @@ class OracleHiveMindRepository(HiveMindRepository):
                   dst.total_duration_sec = dst.total_duration_sec + src.total_duration_sec,
                   dst.last_run = SYSTIMESTAMP
                 WHEN NOT MATCHED THEN INSERT (
-                  kind, success_count, fail_count, cancelled_count,
+                  urn, kind, success_count, fail_count, cancelled_count,
                   total_tokens_in, total_tokens_out, total_cost_usd,
                   total_duration_sec, last_run
                 ) VALUES (
-                  src.kind, src.success_count, src.fail_count, src.cancelled_count,
+                  'aggregate', src.kind, src.success_count, src.fail_count, src.cancelled_count,
                   src.total_tokens_in, src.total_tokens_out, src.total_cost_usd,
                   src.total_duration_sec, SYSTIMESTAMP
                 )
@@ -1074,7 +1425,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         payload: dict[str, Any],
         ts: float,
     ) -> str:
-        msg_id = _uuid7_raw()
+        msg_id = _raw_to_uuid(_uuid7_raw()) or str(uuid.uuid4())
         await self._run(
             self._insert_message_sync,
             msg_id=msg_id,
@@ -1085,7 +1436,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             payload=payload,
             ts=ts,
         )
-        return _raw_to_uuid(msg_id) or ""
+        return msg_id
 
     async def post_message(self, **kwargs: Any) -> None:
         await self.insert_message(
@@ -1100,7 +1451,7 @@ class OracleHiveMindRepository(HiveMindRepository):
     def _insert_message_sync(
         self,
         *,
-        msg_id: bytes,
+        msg_id: str,
         from_urn: str,
         to_urn: Optional[str],
         in_reply_to: Optional[str],
@@ -1122,10 +1473,10 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "id": msg_id,
                     "from_urn": from_urn,
                     "to_urn": to_urn,
-                    "in_reply_to": _uuid_to_raw(in_reply_to) if in_reply_to else None,
+                    "in_reply_to": in_reply_to,
                     "topic": topic,
                     "payload": _json_dumps(payload),
-                    "ts": float(ts),
+                    "ts": _ts_to_tstz(ts),
                 },
             )
             conn.commit()
@@ -1166,7 +1517,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             params["topic"] = topic
         if since_ts is not None:
             sql += " AND ts >= :since_ts"
-            params["since_ts"] = float(since_ts)
+            params["since_ts"] = _ts_to_tstz(since_ts)
         sql += " ORDER BY ts DESC FETCH FIRST :lim ROWS ONLY"
         params["lim"] = max(1, min(int(limit), 1000))
         with self._pool.acquire() as conn:
@@ -1174,8 +1525,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             rows = cur.fetchall() if hasattr(cur, "fetchall") else []
             out: list[dict[str, Any]] = []
             for r in rows:
-                # hive_messages.id + in_reply_to are VARCHAR2(64) UUIDs (not RAW).
-                rid = str(r[0]) if r and r[0] is not None else ""
+                rid = str(r[0]) if r[0] is not None else ""
                 payload_raw = r[5]
                 try:
                     payload = (
@@ -1190,10 +1540,10 @@ class OracleHiveMindRepository(HiveMindRepository):
                         "id": rid,
                         "from_urn": r[1],
                         "to_urn": r[2],
-                        "in_reply_to": (str(r[3]) if r[3] is not None else None),
+                        "in_reply_to": str(r[3]) if r[3] is not None else None,
                         "topic": r[4],
                         "payload": payload,
-                        "ts": float(r[6]) if r[6] is not None else 0.0,
+                        "ts": _dt_to_ts(r[6]) or 0.0,
                     }
                 )
             return out
@@ -1281,7 +1631,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             params["agent_urn"] = agent_urn
         if since_ts is not None:
             sql += " AND ts >= :since_ts"
-            params["since_ts"] = float(since_ts)
+            params["since_ts"] = _ts_to_tstz(since_ts)
         sql += " ORDER BY ts DESC, id DESC FETCH FIRST :lim ROWS ONLY"
         params["lim"] = max(1, min(int(limit), 5000))
         with self._pool.acquire() as conn:
@@ -1301,7 +1651,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                 out.append(
                     {
                         "id": int(r[0]) if r[0] is not None else 0,
-                        "ts": float(r[1]) if r[1] is not None else 0.0,
+                        "ts": _dt_to_ts(r[1]) or 0.0,
                         "kind": r[2],
                         "payload": payload,
                         "agent_urn": r[4],
@@ -1316,11 +1666,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         delta: int = 1,
         **_legacy: Any,
     ) -> None:
-        """Increment hits counter for cache_key. Best-effort ALTER TABLE adds the
-        hits column on first call (idempotent via ORA-01430 swallow); subsequent
-        calls UPDATE only. Failures are silent so cache reads stay usable on
-        snapshots that disallow ALTER — schema owners should land hits via
-        proper migration."""
+        """Atomically increment the canonical cache hit counter."""
         await self._run(
             self._cache_record_hit_sync,
             cache_key=cache_key,
@@ -1334,26 +1680,13 @@ class OracleHiveMindRepository(HiveMindRepository):
         delta: int,
     ) -> None:
         with self._pool.acquire() as conn:
-            try:
-                self._execute(
-                    conn,
-                    "ALTER TABLE memory_hive_cache ADD (hits NUMBER DEFAULT 0 NOT NULL)",
-                    None,
-                )
-                conn.commit()
-            except Exception as exc:
-                msg = str(exc)
-                if "ORA-01430" not in msg and "ORA-00955" not in msg:
-                    return
-            try:
-                self._execute(
-                    conn,
-                    "UPDATE memory_hive_cache SET hits = NVL(hits,0) + :delta " "WHERE cache_key = :ck",
-                    {"delta": int(delta), "ck": cache_key},
-                )
-                conn.commit()
-            except Exception:
-                pass
+            self._execute(
+                conn,
+                "UPDATE hive_cache SET hit_count=hit_count+:delta, last_hit_at=SYSTIMESTAMP "
+                "WHERE cache_key=:ck",
+                {"delta": int(delta), "ck": cache_key},
+            )
+            conn.commit()
 
     async def stats_costs(
         self,
@@ -1362,8 +1695,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         limit: int = 100,
         **_legacy: Any,
     ) -> dict[str, Any]:
-        """Aggregate cost/token totals from memory_worker_kind_stats. Returns
-        {total, by_agent, by_kind}. since_ts filter on last_seen_at."""
+        """Aggregate canonical worker statistics by worker and kind."""
         return await self._run(
             self._stats_costs_sync,
             since_ts=since_ts,
@@ -1379,14 +1711,14 @@ class OracleHiveMindRepository(HiveMindRepository):
         where = ""
         params: dict[str, Any] = {}
         if since_ts is not None:
-            where = " WHERE last_seen_at >= :since_ts"
-            params["since_ts"] = float(since_ts)
+            where = " WHERE last_run >= :since_ts"
+            params["since_ts"] = _ts_to_tstz(since_ts)
         with self._pool.acquire() as conn:
             cur = self._execute(
                 conn,
-                "SELECT NVL(SUM(tokens_in),0), NVL(SUM(tokens_out),0), "
-                "NVL(SUM(est_cost_usd),0), COUNT(DISTINCT agent_urn), "
-                "COUNT(DISTINCT kind) FROM memory_worker_kind_stats" + where,
+                "SELECT NVL(SUM(total_tokens_in),0), NVL(SUM(total_tokens_out),0), "
+                "NVL(SUM(total_cost_usd),0), COUNT(DISTINCT urn), "
+                "COUNT(DISTINCT kind) FROM hive_worker_kind_stats" + where,
                 params,
             )
             tr = cur.fetchone() if hasattr(cur, "fetchone") else None
@@ -1402,8 +1734,8 @@ class OracleHiveMindRepository(HiveMindRepository):
             params_lim["lim"] = lim
             cur = self._execute(
                 conn,
-                "SELECT agent_urn, SUM(tokens_in), SUM(tokens_out), "
-                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where + " GROUP BY agent_urn ORDER BY 4 DESC "
+                "SELECT urn, SUM(total_tokens_in), SUM(total_tokens_out), "
+                "SUM(total_cost_usd) FROM hive_worker_kind_stats" + where + " GROUP BY urn ORDER BY 4 DESC "
                 "FETCH FIRST :lim ROWS ONLY",
                 params_lim,
             )
@@ -1418,8 +1750,8 @@ class OracleHiveMindRepository(HiveMindRepository):
             ]
             cur = self._execute(
                 conn,
-                "SELECT kind, SUM(tokens_in), SUM(tokens_out), "
-                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where + " GROUP BY kind ORDER BY 4 DESC "
+                "SELECT kind, SUM(total_tokens_in), SUM(total_tokens_out), "
+                "SUM(total_cost_usd) FROM hive_worker_kind_stats" + where + " GROUP BY kind ORDER BY 4 DESC "
                 "FETCH FIRST :lim ROWS ONLY",
                 params_lim,
             )
@@ -1524,7 +1856,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "tokens_out": int(tokens_out),
                     "cost_usd": float(cost_usd),
                     "duration_sec": float(duration_sec),
-                    "last_run": float(last_run),
+                    "last_run": _ts_to_tstz(last_run),
                 },
             )
             conn.commit()
@@ -1537,8 +1869,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         limit: int = 100,
         **_legacy: Any,
     ) -> list[dict[str, Any]]:
-        """List rows from memory_worker_kind_stats sorted by last_seen_at DESC,
-        est_cost_usd DESC. Optional kind/since_ts filters."""
+        """List canonical per-worker/per-kind aggregate rows."""
         return await self._run(
             self._stats_workers_sync,
             kind=kind,
@@ -1554,18 +1885,18 @@ class OracleHiveMindRepository(HiveMindRepository):
         limit: int,
     ) -> list[dict[str, Any]]:
         sql = (
-            "SELECT agent_urn, kind, claims, completions, failures, "
-            "tokens_in, tokens_out, est_cost_usd, last_seen_at "
-            "FROM memory_worker_kind_stats WHERE 1=1"
+            "SELECT urn, kind, success_count + fail_count + cancelled_count, "
+            "success_count, fail_count, total_tokens_in, total_tokens_out, "
+            "total_cost_usd, last_run FROM hive_worker_kind_stats WHERE 1=1"
         )
         params: dict[str, Any] = {}
         if kind is not None:
             sql += " AND kind = :kind"
             params["kind"] = kind
         if since_ts is not None:
-            sql += " AND last_seen_at >= :since_ts"
-            params["since_ts"] = float(since_ts)
-        sql += " ORDER BY last_seen_at DESC, est_cost_usd DESC " "FETCH FIRST :lim ROWS ONLY"
+            sql += " AND last_run >= :since_ts"
+            params["since_ts"] = _ts_to_tstz(since_ts)
+        sql += " ORDER BY last_run DESC, total_cost_usd DESC FETCH FIRST :lim ROWS ONLY"
         params["lim"] = max(1, min(int(limit), 1000))
         with self._pool.acquire() as conn:
             cur = self._execute(conn, sql, params)
@@ -1580,10 +1911,14 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "tokens_in": int(r[5]) if r[5] is not None else 0,
                     "tokens_out": int(r[6]) if r[6] is not None else 0,
                     "est_cost_usd": float(r[7]) if r[7] is not None else 0.0,
-                    "last_seen_at": float(r[8]) if r[8] is not None else 0.0,
+                    "last_seen_at": _dt_to_ts(r[8]) or 0.0,
                 }
                 for r in rows
             ]
 
 
-__all__ = ["OracleHiveMindRepository"]
+__all__ = [
+    "ORACLE_SCHEMA_VERSION",
+    "OracleHiveMindRepository",
+    "OracleSchemaCompatibilityError",
+]

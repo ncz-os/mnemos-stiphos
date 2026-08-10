@@ -45,7 +45,23 @@ docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -p 127.0.0.1:8080:8080 ghcr.io/nc
 
 All routes except `/health` require `Authorization: Bearer $HIVE_BUS_TOKEN` by default. Set `HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests. Workers and bridges read `HIVE_BUS_TOKEN` or `MNEMOS_HIVE_BUS_TOKEN` and attach the bearer token automatically.
 
-The sqlite repository self-creates its schema at runtime; for Oracle, apply `mnemos/hive_mind/oracle_ddl.sql`. The shared hive *ledger* tables (`agents`, `jobs`, `subscription_pools`, …) are owned by `mnemos-core`'s migration runner and shared with KNEMON.
+The sqlite repository self-creates its schema at runtime. For a fresh Oracle
+schema, apply `mnemos/hive_mind/oracle_ddl.sql`. The canonical production
+convention is the shared `agents`/`jobs` ledger plus STIPHOS-owned `hive_*`
+tables, recorded as `stiphos-oracle` schema version 2 in
+`hive_schema_metadata`. The Oracle repository validates that marker and the
+required tables during `init()` and refuses to write to an unversioned,
+incomplete, or deprecated schema.
+
+Older installations that have `memory_agents`, `memory_jobs`,
+`memory_messages`, or `memory_events` use the deprecated convention. Back up
+and test the database, then run
+`migrations/oracle/002_memory_to_canonical.sql` explicitly as the schema owner.
+The migration is idempotent, renames the legacy tables, adds the routing and
+subscription-pool fields required by the service contract, and records version
+2. It is never run automatically. If both a legacy and canonical copy of a
+table exist, the migration stops so an operator can reconcile the duplicate
+data rather than silently choosing one.
 
 ## Relationship to the rest of MNEMOS
 
