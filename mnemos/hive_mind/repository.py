@@ -542,7 +542,7 @@ class SqliteHiveMindRepository:
                 "claimed_model, claimed_provider, claimed_cost_tier, started_at, "
                 "retry_backoff_until, ended_at, result, result_mnemos_id, "
                 "tokens_in, tokens_out, estimated_cost_usd, retry_count, max_retries) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "'done', NULL, NULL, NULL, ?, ?, NULL, ?, NULL, ?, ?, ?, "
                 "NULL, NULL, NULL, 0, ?)",
                 (
@@ -560,6 +560,7 @@ class SqliteHiveMindRepository:
                     self._json(kwargs.get("preferred_providers")),
                     self._json(kwargs.get("preferred_models")),
                     self._json(kwargs.get("mnemos_refs")),
+                    self._json(kwargs.get("depends_on")),
                     kwargs.get("model"),
                     kwargs.get("provider"),
                     started,
@@ -1112,6 +1113,7 @@ class SqliteHiveMindRepository:
             "estimated_cost_usd": row[29],
             "retry_count": row[30],
             "max_retries": row[31],
+            "routing_metadata": cls._loads(row[32], {}),
         }
 
     async def emit_event(

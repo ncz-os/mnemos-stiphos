@@ -31,7 +31,7 @@ DB_PATH = agent_bus_db_env()
 HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
 HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
-_PUBLIC_PATHS = {"/health", ""}  # root dashboard collects its API token in-browser
+_PUBLIC_PATHS = {"/health", "", "/dashboard.js"}  # dashboard assets collect the API token in-browser
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -455,11 +455,47 @@ CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lint
 
 
 def cache_key_for(
-    kind: str, description: Optional[str], max_cost_tier: str, required_capabilities: Optional[list[str]]
+    kind: str,
+    description: Optional[str],
+    max_cost_tier: str,
+    required_capabilities: Optional[list[str]],
+    *,
+    submitter_urn: Optional[str] = None,
+    parent_job_id: Optional[str] = None,
+    priority: int = 0,
+    deadline: Optional[float] = None,
+    eligible_kinds: Optional[list[str]] = None,
+    project: Optional[str] = None,
+    preferred_providers: Optional[list[str]] = None,
+    preferred_models: Optional[list[str]] = None,
+    mnemos_refs: Optional[list[str]] = None,
+    depends_on: Optional[list[str]] = None,
+    max_cost_tier_explicit: Optional[bool] = None,
 ) -> str:
-    norm_desc = (description or "").strip()
-    norm_caps = ",".join(sorted(required_capabilities or []))
-    payload = f"{kind}\n{norm_desc}\n{max_cost_tier}\n{norm_caps}"
+    # Versioned canonical representation: every field that can affect routing,
+    # available context, or the worker-visible job is part of equivalence.
+    payload = json.dumps(
+        {
+            "schema": 3,
+            "kind": kind,
+            "description": (description or "").strip(),
+            "max_cost_tier": max_cost_tier,
+            "required_capabilities": sorted(required_capabilities or []),
+            "submitter_urn": submitter_urn,
+            "parent_job_id": parent_job_id,
+            "priority": priority,
+            "deadline": deadline,
+            "eligible_kinds": sorted(eligible_kinds or []),
+            "project": project,
+            "preferred_providers": preferred_providers or [],
+            "preferred_models": preferred_models or [],
+            "mnemos_refs": mnemos_refs or [],
+            "depends_on": depends_on or [],
+            "max_cost_tier_explicit": max_cost_tier_explicit,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return _hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -892,9 +928,29 @@ async def dashboard():
     from fastapi.responses import HTMLResponse
 
     try:
-        return HTMLResponse(files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8"))
+        return HTMLResponse(
+            files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8"),
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; "
+                    "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                )
+            },
+        )
     except (FileNotFoundError, ModuleNotFoundError):
         return HTMLResponse("<h1>dashboard.html missing</h1>", status_code=404)
+
+
+@app.get("/dashboard.js")
+async def dashboard_script():
+    """Serve the packaged dashboard program as a same-origin CSP-safe asset."""
+    from fastapi.responses import Response
+    from importlib.resources import files
+
+    source = files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8")
+    marker = '<script id="dashboard-code" type="text/plain">'
+    script = source.split(marker, 1)[1].split("</script>", 1)[0]
+    return Response(script, media_type="application/javascript", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/v1/agents/register")
@@ -1172,8 +1228,39 @@ async def create_job(req: JobCreate):
             missing = [d for d in req.depends_on if d not in found]
             if missing:
                 raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
-    # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(req.kind, req.description, (req.max_cost_tier or "A").upper(), req.required_capabilities)
+    # Authorize before cache lookup: a cache hit must not turn a forbidden
+    # worker submission into a successful completed job.
+    async with aiosqlite.connect(DB_PATH) as auth_db:
+        async with auth_db.execute("SELECT runtime FROM agents WHERE urn=?", (req.submitter_urn,)) as cur:
+            submitter_row = await cur.fetchone()
+    if submitter_row and (submitter_row[0] or "unknown").lower() in WORKER_ONLY_RUNTIMES:
+        submitter_runtime = (submitter_row[0] or "unknown").lower()
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"role-violation: runtime={submitter_runtime!r} is a WORKER, not an orchestrator. "
+                f"Workers CLAIM jobs via POST /v1/jobs/next, they don't SUBMIT them. "
+                f"If you need to delegate, message a human or claude-code orchestrator instead. "
+                f"Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
+            ),
+        )
+    ck = cache_key_for(
+        req.kind,
+        req.description,
+        (req.max_cost_tier or "A").upper(),
+        req.required_capabilities,
+        submitter_urn=req.submitter_urn,
+        parent_job_id=req.parent_job_id,
+        priority=req.priority,
+        deadline=req.deadline,
+        eligible_kinds=req.eligible_kinds,
+        project=req.project,
+        preferred_providers=req.preferred_providers,
+        preferred_models=req.preferred_models,
+        mnemos_refs=req.mnemos_refs,
+        depends_on=req.depends_on,
+        max_cost_tier_explicit="max_cost_tier" in getattr(req, "model_fields_set", set()),
+    )
     async with aiosqlite.connect(DB_PATH) as db:
         cached = await cache_lookup(db, ck)
         if cached:
@@ -1196,6 +1283,7 @@ async def create_job(req: JobCreate):
                 preferred_providers=req.preferred_providers,
                 preferred_models=req.preferred_models,
                 mnemos_refs=req.mnemos_refs,
+                depends_on=req.depends_on,
                 started_at=now,
                 ended_at=now,
                 result=cached_result,
@@ -1226,22 +1314,8 @@ async def create_job(req: JobCreate):
                 "result": cached["result"],
                 "result_mnemos_id": cached.get("result_mnemos_id"),
             }
-        # role check: submitter must be a registered orchestrator
-        async with db.execute("SELECT runtime FROM agents WHERE urn=?", (req.submitter_urn,)) as cur:
-            row = await cur.fetchone()
-        if row:
-            submitter_runtime = (row[0] or "unknown").lower()
-            if submitter_runtime in WORKER_ONLY_RUNTIMES:
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"role-violation: runtime={submitter_runtime!r} is a WORKER, not an orchestrator. "
-                        f"Workers CLAIM jobs via POST /v1/jobs/next, they don't SUBMIT them. "
-                        f"If you need to delegate, message a human or claude-code orchestrator instead. "
-                        f"Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
-                    ),
-                )
-        # else: submitter not registered → allowed (human/external curl)
+        # Unregistered submitters remain allowed for the documented external
+        # curl/human path; registered worker-only runtimes were rejected above.
         # Phase 2 cut 2: INSERT delegated to repo.insert_job_queued.
         # The cache-hit short-circuit path above still runs inline (different
         # row shape — status='done' + claimed_provider — cut 3 target).
@@ -1432,7 +1506,9 @@ async def update_job(job_id: str, req: JobUpdate):
         if req.status in ("done", "failed", "cancelled"):
             async with db.execute(
                 "SELECT kind, description, max_cost_tier, required_capabilities, "
-                "claimed_model, claimed_provider, claimed_by, result, started_at "
+                "claimed_model, claimed_provider, claimed_by, result, started_at, "
+                "submitter_urn, parent_job_id, priority, deadline, eligible_kinds, project, "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, routing_metadata "
                 "FROM jobs WHERE id=?",
                 (job_id,),
             ) as attempt_cur:
@@ -1470,7 +1546,9 @@ async def update_job(job_id: str, req: JobUpdate):
         if req.status in ("done", "failed", "cancelled"):
             jrow = attempt_jrow
             if jrow:
-                kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
+                (kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j,
+                 submitter_j, parent_j, priority_j, deadline_j, eligible_json, project_j,
+                 preferred_providers_json, preferred_models_json, refs_json, depends_json, routing_metadata_json) = jrow
                 # capability scoring stats
                 if claimed_by_j and kind_j:
                     duration = (time.time() - (started_j or time.time())) if started_j else 0
@@ -1504,7 +1582,25 @@ async def update_job(job_id: str, req: JobUpdate):
                 # cache only successful results
                 if req.status == "done":
                     ck = cache_key_for(
-                        kind_j, desc_j, (mtier or "A").upper(), json.loads(reqcaps_json) if reqcaps_json else None
+                        kind_j,
+                        desc_j,
+                        (mtier or "A").upper(),
+                        json.loads(reqcaps_json) if reqcaps_json else None,
+                        submitter_urn=submitter_j,
+                        parent_job_id=parent_j,
+                        priority=priority_j,
+                        deadline=deadline_j,
+                        eligible_kinds=json.loads(eligible_json) if eligible_json else None,
+                        project=project_j,
+                        preferred_providers=json.loads(preferred_providers_json) if preferred_providers_json else None,
+                        preferred_models=json.loads(preferred_models_json) if preferred_models_json else None,
+                        mnemos_refs=json.loads(refs_json) if refs_json else None,
+                        depends_on=json.loads(depends_json) if depends_json else None,
+                        max_cost_tier_explicit=bool(
+                            (json.loads(routing_metadata_json) if routing_metadata_json else {}).get(
+                                "submitter_max_cost_tier_explicit"
+                            )
+                        ),
                     )
                     rdict = json.loads(result_j) if result_j else (req.result or {})
                     ec = (rdict or {}).get("exit_code")

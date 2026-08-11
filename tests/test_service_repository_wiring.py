@@ -21,7 +21,12 @@ class _ServiceDbKnemonBackend:
 
     @asynccontextmanager
     async def transactional(self):
-        yield self.conn
+        try:
+            yield self.conn
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
 
 def _knemon_router():
@@ -233,7 +238,10 @@ def test_hive_routing_patch_enforces_zeroclaw_model_affinity(monkeypatch, tmp_pa
                 "preferred_providers": ["groq"],
                 "preferred_models": ["qwen3-32b"],
                 "max_cost_tier": "B",
-                "routing_metadata": {"router": "knemon"},
+                "routing_metadata": {
+                    "router": "knemon",
+                    "decision": {"reservation_id": "r" * 36},
+                },
             },
         )
         assert routed.status_code == 200, routed.text
@@ -245,6 +253,7 @@ def test_hive_routing_patch_enforces_zeroclaw_model_affinity(monkeypatch, tmp_pa
         assert right_claim.status_code == 200, right_claim.text
         assert right_claim.json()["id"] == job_id
         assert right_claim.json()["preferred_models"] == ["qwen3-32b"]
+        assert right_claim.json()["routing_metadata"]["decision"]["reservation_id"] == "r" * 36
 
 
 def test_default_cap_zeroclaw_route_to_tier_b_is_claimable(monkeypatch, tmp_path) -> None:

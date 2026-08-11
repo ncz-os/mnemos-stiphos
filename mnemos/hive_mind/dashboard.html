@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <title>GRAEAE Hive Mind</title>
 <style>
   body { background:#0d1117; color:#c9d1d9; font-family:-apple-system,Menlo,monospace; margin:0; padding:1em; }
@@ -68,26 +69,21 @@
     <div id="events"></div>
   </div>
 </div>
-<script>
+<script id="dashboard-code" type="text/plain">
 const BUS = location.origin;
-const TOKEN_KEY = 'mnemos.stiphos.bus-token';
-let busToken = sessionStorage.getItem(TOKEN_KEY) || '';
-if (!busToken) {
-  busToken = window.prompt('Hive bus token (kept in this browser tab only):') || '';
-  if (busToken) sessionStorage.setItem(TOKEN_KEY, busToken);
-}
+let busToken = window.prompt('Hive bus token (kept in memory until this tab reloads):') || '';
 const authHeaders = () => busToken ? {'Authorization': `Bearer ${busToken}`} : {};
 async function load(path) {
   const response = await fetch(BUS+path, {headers: authHeaders()});
   if (response.status === 401 || response.status === 503) {
-    sessionStorage.removeItem(TOKEN_KEY);
     throw new Error('authentication failed; reload to enter the Hive bus token');
   }
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.json();
 }
 function tag(t,c){const s=document.createElement('span');s.className='tag '+c;s.textContent=t;return s;}
-function td(html){const t=document.createElement('td');if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
+function td(value){const t=document.createElement('td');if(value instanceof Node)t.appendChild(value);else t.textContent=String(value ?? '');return t;}
+function small(value){const s=document.createElement('small');s.className='dim';s.textContent=String(value ?? '');return s;}
 async function refreshAgents(){
   const d = await load('/v1/agents?status=online');
   // Dedup display by (kind,host,runtime,model) and show instance count.
@@ -107,41 +103,39 @@ async function refreshAgents(){
   }
   const rows = [...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
   document.getElementById('agent-count').textContent = `${rows.length} pools · ${d.count} instances`;
-  const tb = document.querySelector('#agent-tbl tbody'); tb.innerHTML='';
+  const tb = document.querySelector('#agent-tbl tbody'); tb.replaceChildren();
   for (const a of rows) {
     const r = tb.insertRow();
-    const kindCell = a.kind + (a.count > 1 ? ` <small class="dim">×${a.count}</small>` : '');
+    const kindCell = a.kind + (a.count > 1 ? ` ×${a.count}` : '');
     r.appendChild(td(kindCell));
     r.appendChild(td(a.host));
     r.appendChild(td(a.runtime||''));
     r.appendChild(td(a.model||''));
     const tt = td(''); tt.appendChild(tag(a.cost_tier||'?', 't-'+(a.cost_tier||'C'))); r.appendChild(tt);
     r.appendChild(td(a.auth_method||''));
-    r.appendChild(td(`<small class="dim">${(a.capabilities||[]).slice(0,4).join(',')}</small>`));
+    r.appendChild(td(small((a.capabilities||[]).slice(0,4).join(','))));
   }
 }
 async function refreshJobs(){
   const [q,c] = await Promise.all([load('/v1/jobs?status=queued&limit=25'), load('/v1/jobs?status=claimed&limit=25')]);
-  const tb = document.querySelector('#jobs-tbl tbody'); tb.innerHTML='';
+  const tb = document.querySelector('#jobs-tbl tbody'); tb.replaceChildren();
   const all = [...c.jobs, ...q.jobs].sort((a,b)=>b.priority-a.priority);
   for (const j of all.slice(0,25)) {
     const r = tb.insertRow();
     r.appendChild(td(`P${j.priority}`));
     r.appendChild(td(j.kind));
-    const sd = td(''); sd.innerHTML = `<span class="s-${j.status}">${j.status}</span>`; r.appendChild(sd);
+    const sd = td(tag(j.status, `s-${j.status}`)); r.appendChild(sd);
     r.appendChild(td(j.claimed_by ? j.claimed_by.split(':').slice(2).join(':').slice(0,18) : '-'));
     r.appendChild(td(j.estimated_cost_usd ? '$'+j.estimated_cost_usd.toFixed(4) : '-'));
-    r.appendChild(td(`<small class="dim">${(j.description||'').slice(0,60)}</small>`));
+    r.appendChild(td(small((j.description||'').slice(0,60))));
   }
 }
 async function refreshCosts(){
   const d = await load('/v1/stats/costs?group_by=provider&since_hours=24');
   const tot = d.totals;
-  document.getElementById('cost-totals').innerHTML =
-    `<span class="stat">jobs <b>${tot.job_count}</b></span>`+
-    `<span class="stat">tokens in/out <b>${(tot.tokens_in||0).toLocaleString()}/${(tot.tokens_out||0).toLocaleString()}</b></span>`+
-    `<span class="stat">spent <b class="savings">$${(tot.estimated_cost_usd||0).toFixed(4)}</b></span>`;
-  const tb = document.querySelector('#cost-tbl tbody'); tb.innerHTML='';
+  document.getElementById('cost-totals').textContent =
+    `jobs ${tot.job_count} · tokens in/out ${(tot.tokens_in||0).toLocaleString()}/${(tot.tokens_out||0).toLocaleString()} · spent $${(tot.estimated_cost_usd||0).toFixed(4)}`;
+  const tb = document.querySelector('#cost-tbl tbody'); tb.replaceChildren();
   for (const b of d.buckets.slice(0,8)) {
     const r = tb.insertRow();
     r.appendChild(td(b.bucket));
@@ -154,32 +148,29 @@ async function refreshCosts(){
 async function refreshCache(){
   const d = await load('/v1/stats/cache');
   const tot = d.totals;
-  document.getElementById('cache-totals').innerHTML =
-    `<span class="stat">entries <b>${tot.cached_jobs}</b></span>`+
-    `<span class="stat">hits <b>${tot.total_hits}</b></span>`+
-    `<span class="stat">short-circuits <b>${tot.jobs_short_circuited}</b></span>`+
-    `<span class="stat">saved <b class="savings">$${tot.total_cost_saved_usd}</b></span>`;
-  const tb = document.querySelector('#cache-tbl tbody'); tb.innerHTML='';
+  document.getElementById('cache-totals').textContent =
+    `entries ${tot.cached_jobs} · hits ${tot.total_hits} · short-circuits ${tot.jobs_short_circuited} · saved $${tot.total_cost_saved_usd}`;
+  const tb = document.querySelector('#cache-tbl tbody'); tb.replaceChildren();
   for (const e of d.top_entries) {
     const r = tb.insertRow();
-    r.appendChild(td(`<small class="dim">${e.cache_key}</small>`));
+    r.appendChild(td(small(e.cache_key)));
     r.appendChild(td(e.hit_count));
     r.appendChild(td('$'+(e.cost_saved_usd||0).toFixed(4)));
     r.appendChild(td(e.model||'?'));
-    r.appendChild(td(`<small class="dim">${(e.source_job_id||'').slice(0,8)}</small>`));
+    r.appendChild(td(small((e.source_job_id||'').slice(0,8))));
   }
 }
 async function refreshWorkers(){
   const d = await load('/v1/stats/workers?top_n=20');
-  const tb = document.querySelector('#wstats-tbl tbody'); tb.innerHTML='';
+  const tb = document.querySelector('#wstats-tbl tbody'); tb.replaceChildren();
   for (const w of d.workers.slice(0,15)) {
     const parts = (w.urn||'').split(':');
     const lab = parts.length>=4 ? `${parts[1]}@${parts[3].slice(-12)}` : w.urn;
     const r = tb.insertRow();
-    r.appendChild(td(`<small class="dim">${lab}</small>`));
+    r.appendChild(td(small(lab)));
     r.appendChild(td(w.kind));
-    r.appendChild(td(`<span class="s-done">${w.success_count}</span>`));
-    r.appendChild(td(`<span class="s-failed">${w.fail_count}</span>`));
+    r.appendChild(td(tag(w.success_count, 's-done')));
+    r.appendChild(td(tag(w.fail_count, 's-failed')));
     r.appendChild(td((w.success_pct||0)+'%'));
     r.appendChild(td(w.avg_duration_sec||0));
     r.appendChild(td('$'+(w.total_cost_usd||0).toFixed(4)));
@@ -187,12 +178,12 @@ async function refreshWorkers(){
 }
 async function refreshSchedules(){
   const d = await load('/v1/schedules');
-  const tb = document.querySelector('#sched-tbl tbody'); tb.innerHTML='';
+  const tb = document.querySelector('#sched-tbl tbody'); tb.replaceChildren();
   for (const s of d.schedules) {
     const r = tb.insertRow();
     r.appendChild(td(s.name));
     r.appendChild(td(s.interval_seconds+'s'));
-    r.appendChild(td(s.enabled ? '<span class="s-online">on</span>' : '<span class="s-offline">off</span>'));
+    r.appendChild(td(tag(s.enabled ? 'on' : 'off', s.enabled ? 's-online' : 's-offline')));
     r.appendChild(td(s.fire_count));
     r.appendChild(td(s.next_fire_at ? new Date(s.next_fire_at*1000).toLocaleTimeString() : '-'));
   }
@@ -205,7 +196,7 @@ async function refreshAll(){
 // Authenticated SSE live event tail. EventSource cannot set bearer headers, so
 // consume the text/event-stream with fetch instead.
 const evDiv = document.getElementById('events');
-function evLine(s){ const d = document.createElement('div'); d.className='ev'; d.innerHTML = s; evDiv.insertBefore(d, evDiv.firstChild); while(evDiv.children.length > 30) evDiv.removeChild(evDiv.lastChild); }
+function evLine(s){ const d = document.createElement('div'); d.className='ev'; d.textContent=String(s); evDiv.insertBefore(d, evDiv.firstChild); while(evDiv.children.length > 30) evDiv.removeChild(evDiv.lastChild); }
 async function streamEvents() {
   try {
     const response = await fetch(BUS+'/v1/events', {headers: authHeaders()});
@@ -217,15 +208,15 @@ async function streamEvents() {
       const {value, done} = await reader.read();
       if (done) break;
       pending += decoder.decode(value, {stream:true});
-      const blocks = pending.split('\n\n'); pending = blocks.pop() || '';
+      const blocks = pending.split(/\r?\n\r?\n/); pending = blocks.pop() || '';
       for (const block of blocks) {
-        const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+        const data = block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
         if (!data) continue;
-        try { const d=JSON.parse(data); evLine(`<span class="kind">${d.kind}</span> ${JSON.stringify(d.payload).slice(0,180)}`); } catch(e) {}
+        try { const d=JSON.parse(data); evLine(`${d.kind} ${JSON.stringify(d.payload).slice(0,180)}`); } catch(e) {}
       }
     }
   } catch(e) {
-    evLine(`<span style="color:#f85149">SSE disconnected: ${String(e)}</span>`);
+    evLine(`SSE disconnected: ${String(e)}`);
     setTimeout(streamEvents, 3000);
   }
 }
@@ -233,5 +224,6 @@ streamEvents();
 refreshAll();
 setInterval(refreshAll, 5000);
 </script>
+<script src="/dashboard.js"></script>
 </body>
 </html>

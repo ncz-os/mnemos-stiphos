@@ -44,6 +44,8 @@ from typing import Optional
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
+MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002").rstrip("/")
+MNEMOS_TOKEN = os.environ.get("MNEMOS_API_KEY") or os.environ.get("MNEMOS_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "zeroclaw")
 ZEROCLAW_AGENT = os.environ.get("ZEROCLAW_AGENT", "hive")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
@@ -229,6 +231,13 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 10.
         return 0, None
 
 
+def _fatal_auth(operation: str, code: int) -> None:
+    global _running, _fatal_error
+    print(f"[zc-worker] fatal authentication rejection during {operation}: HTTP {code}", flush=True)
+    _fatal_error = True
+    _running = False
+
+
 def _zeroclaw_version() -> str:
     try:
         out = subprocess.run([ZEROCLAW_BIN, "--version"], capture_output=True, text=True, timeout=5)
@@ -357,7 +366,7 @@ def _detect_subscription_pools() -> list[str]:
 
 def register() -> str:
     """Register with hive. Retry with exponential backoff until success.
-    Never returns failure — workers cannot operate without a URN."""
+    Return an empty URN after shutdown or permanent auth rejection."""
     global _urn, _last_heartbeat
     body = {
         "kind": "zeroclaw",
@@ -388,6 +397,9 @@ def register() -> str:
             _last_heartbeat = time.time()
             print(f"[zc-worker] registered urn={_urn} (attempt {attempt})", flush=True)
             return _urn
+        if code in (401, 403):
+            _fatal_auth("registration", code)
+            break
         print(
             f"[zc-worker] register attempt={attempt} failed code={code} resp={str(resp)[:200]} — retry in {backoff:.0f}s",
             flush=True,
@@ -398,9 +410,9 @@ def register() -> str:
             time.sleep(1.0)
             slept += 1.0
         backoff = min(backoff * 1.5, 60.0)  # cap 60s
-    # _running flipped (SIGTERM) — exit cleanly
+    # _running flipped by SIGTERM or a fatal authentication rejection.
     print("[zc-worker] shutting down before register success", flush=True)
-    sys.exit(0)
+    return ""
 
 
 def heartbeat():
@@ -410,6 +422,9 @@ def heartbeat():
         return
     code, resp = _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
     _last_heartbeat = time.time()
+    if code in (401, 403):
+        _fatal_auth("heartbeat", code)
+        return
     # If hive lost our URN (404 or "not found"), re-register
     if code == 404 or (code in (400, 410) and resp and "not found" in str(resp).lower()):
         print(f"[zc-worker] heartbeat 404 — URN expired, re-registering", flush=True)
@@ -418,6 +433,9 @@ def heartbeat():
 
 def claim_next_job() -> dict | None:
     code, resp = _http("POST", f"/v1/jobs/next?agent_urn={_urn}")
+    if code in (401, 403):
+        _fatal_auth("dequeue", code)
+        return None
     if code == 200 and resp:
         return resp
     if code != 204 and code != 0:
@@ -462,6 +480,85 @@ def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = Fa
         heartbeat()
         time.sleep(delay)
         delay = min(delay * 2, 30.0)
+    return False
+
+
+def record_knemon_usage(job: dict, result: dict, status: str) -> bool:
+    """Write usage and atomically reconcile a KNEMON routing reservation."""
+    global _running, _fatal_error
+    metadata = job.get("routing_metadata") or {}
+    decision = metadata.get("decision") if isinstance(metadata, dict) else None
+    reservation_id = decision.get("reservation_id") if isinstance(decision, dict) else None
+    if not reservation_id:
+        return True
+    if not MNEMOS_TOKEN:
+        print("[zc-worker] fatal: routed job has a KNEMON reservation but MNEMOS_TOKEN is unset", flush=True)
+        _fatal_error = True
+        _running = False
+        return False
+
+    provider = str(result.get("provider_used") or decision.get("provider") or "unknown").lower()
+    model = str(decision.get("model_id") or AGENT_MODEL)
+    auth_method = str(decision.get("auth_method") or "api")
+    path_kind = str(decision.get("path_kind") or auth_method)
+    plan_tier = str(decision.get("plan_name") or auth_method)
+    if provider != str(decision.get("provider") or "").lower():
+        for alternate in decision.get("fallback_chain") or []:
+            if len(alternate) >= 2 and str(alternate[0]).lower() == provider:
+                model = str(alternate[1])
+                auth_method = str(alternate[2]) if len(alternate) > 2 else "api"
+                path_kind = str(alternate[3]) if len(alternate) > 3 else auth_method
+                plan_tier = auth_method
+                break
+    if auth_method == "subscription" and provider == str(decision.get("provider") or "").lower():
+        pools = metadata.get("required_subscription_pools") or []
+        specific_pools = [pool for pool in pools if not str(pool).endswith("_subscription")]
+        if specific_pools:
+            plan_tier = str(specific_pools[0])
+    error_text = str(result.get("error") or result.get("stderr") or "").lower()
+    outcome = "ok" if status == "done" else ("timeout" if "timeout" in error_text else "err")
+    body = {
+        "provider": provider,
+        "model": model,
+        "task_kind": str(job.get("kind") or "unknown"),
+        "tokens_in": max(0, int(result.get("tokens_in") or 0)),
+        "tokens_out": max(0, int(result.get("tokens_out") or 0)),
+        "latency_ms": max(0, int(float(result.get("duration_sec") or 0) * 1000)),
+        "outcome": outcome,
+        "caller_subsystem": "zeroclaw",
+        "tier": plan_tier,
+        "session_id": f"stiphos-job:{job.get('id')}",
+        "path_kind": path_kind,
+        "reservation_id": reservation_id,
+    }
+    request = urllib.request.Request(
+        f"{MNEMOS_URL}/v1/ledger",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"content-type": "application/json", "authorization": f"Bearer {MNEMOS_TOKEN}"},
+    )
+    delay = 1.0
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(request, timeout=15.0) as response:
+                if response.status == 200:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                _fatal_auth("KNEMON ledger reconciliation", exc.code)
+                return False
+            if 400 <= exc.code < 500:
+                print(f"[zc-worker] fatal KNEMON ledger rejection: HTTP {exc.code}", flush=True)
+                _fatal_error = True
+                _running = False
+                return False
+        except Exception as exc:
+            print(f"[zc-worker] KNEMON ledger attempt {attempt + 1} failed: {exc}", flush=True)
+        if attempt < 4:
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    _fatal_error = True
+    _running = False
     return False
 
 
@@ -970,12 +1067,14 @@ def run_zeroclaw(
             with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
                 proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=stdout_file, stderr=stderr_file, text=True, env=child_env)
                 last_job_hb = time.time()
+                attempt_timed_out = False
                 while True:
                     try:
                         proc.wait(timeout=30)
                         break
                     except subprocess.TimeoutExpired:
                         elapsed = time.time() - start
+                        attempt_elapsed = time.time() - attempt_start
                         if elapsed >= timeout:
                             proc.kill()
                             proc.wait()
@@ -988,6 +1087,11 @@ def run_zeroclaw(
                                 "workdir": exec_cwd,
                                 "providers_attempted": providers_attempted,
                             }
+                        if attempt_elapsed >= PER_ATTEMPT_TIMEOUT:
+                            proc.kill()
+                            proc.wait()
+                            attempt_timed_out = True
+                            break
                         if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
                             try:
                                 job_heartbeat_fn(round(elapsed, 1))
@@ -996,6 +1100,16 @@ def run_zeroclaw(
                             last_job_hb = time.time()
                 last_stdout = _read_output_tail(stdout_file, 12000)
                 last_stderr = _read_output_tail(stderr_file, 4000)
+
+            if attempt_timed_out:
+                last_stderr = (
+                    last_stderr + f"\nprovider attempt timeout {PER_ATTEMPT_TIMEOUT}s exceeded ({agent_alias})"
+                ).strip()
+                print(
+                    f"[zc-worker] provider={agent_alias} timed out after {PER_ATTEMPT_TIMEOUT}s; advancing chain",
+                    flush=True,
+                )
+                continue
 
             # Success → break out of fallback loop
             if proc.returncode == 0:
@@ -1104,6 +1218,8 @@ def main():
         )
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
+        if not record_knemon_usage(job, result, status):
+            break
         if not update_job(job["id"], status, result, require_ack=True):
             if not _running:
                 break
@@ -1112,7 +1228,7 @@ def main():
             f"[zc-worker] {status} job {job['id'][:8]} exit={result.get('exit_code')} dur={result.get('duration_sec')}s",
             flush=True,
         )
-    print("[zc-worker] clean shutdown", flush=True)
+    print("[zc-worker] fatal shutdown" if _fatal_error else "[zc-worker] clean shutdown", flush=True)
     return 1 if _fatal_error else 0
 
 

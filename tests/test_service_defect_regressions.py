@@ -135,8 +135,14 @@ def test_dashboard_loads_packaged_asset(monkeypatch, tmp_path) -> None:
     _configure_service(monkeypatch, tmp_path, "dashboard.sqlite3")
     with TestClient(service.app) as client:
         response = client.get("/")
+        script = client.get("/dashboard.js")
     assert response.status_code == 200
     assert "<!doctype html>" in response.text.lower()
+    assert "script-src 'self'" in response.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert script.status_code == 200
+    assert script.headers["content-type"].startswith("application/javascript")
+    assert "window.prompt" in script.text
 
 
 def test_service_refuses_to_silently_ignore_oracle_backend_request(monkeypatch, tmp_path) -> None:
@@ -145,3 +151,54 @@ def test_service_refuses_to_silently_ignore_oracle_backend_request(monkeypatch, 
     with pytest.raises(RuntimeError, match="supports only SQLite"):
         with TestClient(service.app):
             pass
+
+
+def test_cache_equivalence_includes_context(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "cache-context.sqlite3")
+    with TestClient(service.app) as client:
+        submitter = client.post("/v1/agents/register", json={"runtime": "claude-code", "host": "studio"}).json()
+        worker = client.post(
+            "/v1/agents/register", json={"runtime": "zeroclaw", "host": "worker", "provider": "ngc"}
+        ).json()
+        first = client.post(
+            "/v1/jobs",
+            json={"submitter_urn": submitter["urn"], "kind": "review", "description": "same", "mnemos_refs": ["mem_a"]},
+        )
+        job_id = first.json()["id"]
+        assert client.post(f"/v1/jobs/next?agent_urn={worker['urn']}").status_code == 200
+        assert client.patch(
+            f"/v1/jobs/{job_id}",
+            json={"status": "done", "claimed_by": worker["urn"], "result": {"exit_code": 0}},
+        ).status_code == 200
+        second = client.post(
+            "/v1/jobs",
+            json={"submitter_urn": submitter["urn"], "kind": "review", "description": "same", "mnemos_refs": ["mem_b"]},
+        )
+
+    assert second.status_code == 200
+    assert second.json().get("cache_hit") is not True
+
+
+def test_worker_submitter_is_rejected_before_cache_lookup(monkeypatch, tmp_path) -> None:
+    db_path = _configure_service(monkeypatch, tmp_path, "cache-auth.sqlite3")
+    with TestClient(service.app) as client:
+        worker = client.post(
+            "/v1/agents/register", json={"runtime": "zeroclaw", "host": "worker", "provider": "ngc"}
+        ).json()
+        key = service.cache_key_for("review", "same", "A", None, submitter_urn=worker["urn"])
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "INSERT INTO hive_cache (cache_key,result_json,source_job_id,cached_at) VALUES (?,?,?,?)",
+                (key, '{"answer":"cached"}', "source", __import__("time").time()),
+            )
+        response = client.post(
+            "/v1/jobs", json={"submitter_urn": worker["urn"], "kind": "review", "description": "same"}
+        )
+
+    assert response.status_code == 403
+
+
+def test_cache_equivalence_distinguishes_explicit_default_cost_cap() -> None:
+    omitted = service.cache_key_for("review", "same", "A", None, max_cost_tier_explicit=False)
+    explicit = service.cache_key_for("review", "same", "A", None, max_cost_tier_explicit=True)
+    assert omitted != explicit

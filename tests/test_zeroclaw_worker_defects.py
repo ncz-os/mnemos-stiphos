@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -72,6 +73,26 @@ def test_terminal_update_stops_on_auth_rejection(monkeypatch: pytest.MonkeyPatch
     assert worker._fatal_error is True
 
 
+@pytest.mark.parametrize("operation", ["register", "heartbeat", "dequeue"])
+def test_all_bus_operations_stop_on_auth_rejection(monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
+    monkeypatch.setattr(worker, "_http", lambda *_args: (401, None))
+    monkeypatch.setattr(worker, "_detect_subscription_pools", lambda: [])
+    monkeypatch.setattr(worker, "_zeroclaw_version", lambda: "test")
+    monkeypatch.setattr(worker, "_running", True)
+    monkeypatch.setattr(worker, "_fatal_error", False)
+    monkeypatch.setattr(worker, "_last_heartbeat", 0.0)
+
+    if operation == "register":
+        assert worker.register() == ""
+    elif operation == "heartbeat":
+        worker.heartbeat()
+    else:
+        assert worker.claim_next_job() is None
+
+    assert worker._running is False
+    assert worker._fatal_error is True
+
+
 def test_terminal_update_bounds_server_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(worker, "_http", lambda *args: (calls.append(args) or (500, None)))
@@ -139,3 +160,90 @@ def test_agent_output_is_redirected_to_files_not_blocking_pipes(monkeypatch: pyt
 
     assert result["exit_code"] == 0
     assert len(result["stdout"]) == 12_000
+
+
+def test_per_attempt_timeout_advances_provider_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    processes = []
+
+    class HungProcess:
+        returncode = None
+        killed = False
+
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                raise subprocess.TimeoutExpired("zeroclaw", timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    def fake_popen(*_args, **_kwargs):
+        proc = HungProcess()
+        processes.append(proc)
+        return proc
+
+    tick = {"value": 0.0}
+
+    def fake_time():
+        tick["value"] += 6.0
+        return tick["value"]
+
+    monkeypatch.setattr(worker, "_load_registry", lambda: None)
+    aliases = [worker._PRIMARY_BC, "hive_ngc_2"]
+    monkeypatch.setattr(worker, "_HARDCODED_FALLBACK", {"A": aliases, "B": aliases, "C": aliases})
+    monkeypatch.setattr(worker, "PER_ATTEMPT_TIMEOUT", 10)
+    monkeypatch.setattr(worker, "ZEROCLAW_TIMEOUT", 300)
+    monkeypatch.setattr(worker.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(worker.time, "time", fake_time)
+
+    result = worker.run_zeroclaw("hang", max_cost_tier="A")
+
+    assert len(processes) == 2
+    assert all(proc.killed for proc in processes)
+    assert result["providers_attempted"] == aliases
+
+
+def test_knemon_reservation_is_reconciled_with_execution_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data)
+        captured["authorization"] = request.headers["Authorization"]
+        return Response()
+
+    monkeypatch.setattr(worker, "MNEMOS_URL", "http://mnemos.test")
+    monkeypatch.setattr(worker, "MNEMOS_TOKEN", "secret")
+    monkeypatch.setattr(worker.urllib.request, "urlopen", fake_urlopen)
+    job = {
+        "id": "job-1",
+        "kind": "review",
+        "routing_metadata": {
+            "decision": {
+                "provider": "groq",
+                "model_id": "qwen",
+                "auth_method": "api",
+                "path_kind": "api",
+                "reservation_id": "r" * 36,
+            }
+        },
+    }
+
+    assert worker.record_knemon_usage(
+        job, {"provider_used": "groq", "tokens_in": 10, "tokens_out": 2, "duration_sec": 1.5}, "done"
+    )
+    assert captured["url"] == "http://mnemos.test/v1/ledger"
+    assert captured["body"]["reservation_id"] == "r" * 36
+    assert captured["body"]["session_id"] == "stiphos-job:job-1"
+    assert captured["body"]["outcome"] == "ok"
+    assert captured["authorization"] == "Bearer secret"

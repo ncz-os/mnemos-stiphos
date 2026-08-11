@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 
 BUS_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 URN = os.environ.get("AGENT_URN")
 DRY = "--dry-run" in sys.argv
 
@@ -59,7 +60,10 @@ REPO_MAP = {
 
 
 def http_get_jobs(status: str, limit: int = 1000) -> list[dict]:
-    req = urllib.request.Request(f"{BUS_URL}/v1/jobs?status={status}&limit={limit}")
+    req = urllib.request.Request(
+        f"{BUS_URL}/v1/jobs?status={status}&limit={limit}",
+        headers={"authorization": f"Bearer {HIVE_BUS_TOKEN}"},
+    )
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r).get("jobs", [])
 
@@ -69,7 +73,7 @@ def http_post_job(payload: dict) -> dict:
     req = urllib.request.Request(
         f"{BUS_URL}/v1/jobs",
         data=body,
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "authorization": f"Bearer {HIVE_BUS_TOKEN}"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -135,6 +139,9 @@ def resubmit(j: dict, with_directive: bool) -> dict | None:
 
 
 def main() -> int:
+    if not HIVE_BUS_TOKEN:
+        print("FATAL: set HIVE_BUS_TOKEN or MNEMOS_HIVE_BUS_TOKEN")
+        return 1
     if not URN:
         print("FATAL: set AGENT_URN env var")
         return 1

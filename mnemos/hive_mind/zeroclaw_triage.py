@@ -148,6 +148,9 @@ def route_job(job: dict[str, Any]) -> dict[str, Any] | None:
         "est_tokens_in": est_in,
         "est_tokens_out": est_out,
         "caller_subsystem": "zeroclaw",
+        # Stable per job and useful as the ledger audit/workspace label. KNEMON
+        # derives reservation ownership from the authenticated user.
+        "caller_session_id": f"stiphos-job:{job.get('id')}",
         "require_capability": ",".join(job.get("required_capabilities") or []),
     }
     if _submitter_max_cost_tier_explicit(job):

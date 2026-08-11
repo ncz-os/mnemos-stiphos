@@ -17,9 +17,9 @@ Tools:
   hive.job_update           -> PATCH /v1/jobs/{id}
   hive.message_publish      -> POST /v1/messages
   hive.message_list         -> GET /v1/messages
-  mnemos.memory_search      -> POST /memories/search on PYTHIA
-  mnemos.memory_create      -> POST /memories
-  mnemos.memory_get         -> GET /memories/{id}
+  mnemos.memory_search      -> POST /v1/memories/search on PYTHIA
+  mnemos.memory_create      -> POST /v1/memories
+  mnemos.memory_get         -> GET /v1/memories/{id}
 """
 
 from __future__ import annotations
@@ -300,11 +300,17 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "hive.message_list":
             r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
         elif name == "mnemos.memory_search":
-            r = await _mnemos("POST", "/memories/search", json=args)
+            r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos.memory_create":
-            r = await _mnemos("POST", "/memories", json=args)
+            payload = dict(args)
+            tags = payload.pop("tags", None)
+            if tags is not None:
+                metadata = dict(payload.get("metadata") or {})
+                metadata["tags"] = tags
+                payload["metadata"] = metadata
+            r = await _mnemos("POST", "/v1/memories", json=payload)
         elif name == "mnemos.memory_get":
-            r = await _mnemos("GET", f"/memories/{args['id']}")
+            r = await _mnemos("GET", f"/v1/memories/{args['id']}")
         elif name == "graeae.consult":
             r = await _mnemos("POST", "/v1/consultations", json=args)
         elif name == "graeae.muses":
