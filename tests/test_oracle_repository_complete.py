@@ -473,6 +473,17 @@ def test_oracle_ddl_and_forward_migration_declare_canonical_schema() -> None:
     assert migration.index("require_columns('JOBS'") < migration.index("MERGE INTO hive_schema_metadata")
 
 
+def test_oracle_job_descriptions_remain_lossless_clobs() -> None:
+    root = Path(__file__).parents[1]
+    ddl = (root / "mnemos/hive_mind/oracle_ddl.sql").read_text()
+    migration = (root / "migrations/oracle/002_memory_to_canonical.sql").read_text()
+
+    assert "description           CLOB" in ddl
+    assert "kind VARCHAR2(64) NOT NULL, description CLOB" in migration
+    assert "DBMS_LOB.SUBSTR(description,4000,1)" not in migration
+    assert "Job description length mismatch after migration" in migration
+
+
 @pytest.mark.asyncio
 async def test_fresh_canonical_ddl_produces_schema_accepted_on_init() -> None:
     ddl = (Path(__file__).parents[1] / "mnemos/hive_mind/oracle_ddl.sql").read_text()

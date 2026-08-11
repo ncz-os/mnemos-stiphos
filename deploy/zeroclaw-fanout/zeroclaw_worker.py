@@ -23,6 +23,9 @@ Env:
   OPENAI_SUBSCRIPTION_POOLS comma-sep exact OpenAI pool aliases; include
                         openai_subscription only when intentionally pooling
                         ChatGPT and Codex capacity together
+  ZC_DECISION_ALIAS_<PROVIDER>_<PATH>
+                        exact ZeroClaw alias for a subscription execution path
+                        (for example ZC_DECISION_ALIAS_OPENAI_CODEX)
 """
 
 from __future__ import annotations
@@ -497,24 +500,22 @@ def record_knemon_usage(job: dict, result: dict, status: str) -> bool:
         _running = False
         return False
 
-    provider = str(result.get("provider_used") or decision.get("provider") or "unknown").lower()
-    model = str(decision.get("model_id") or AGENT_MODEL)
-    auth_method = str(decision.get("auth_method") or "api")
-    path_kind = str(decision.get("path_kind") or auth_method)
-    plan_tier = str(decision.get("plan_name") or auth_method)
-    if provider != str(decision.get("provider") or "").lower():
-        for alternate in decision.get("fallback_chain") or []:
-            if len(alternate) >= 2 and str(alternate[0]).lower() == provider:
-                model = str(alternate[1])
-                auth_method = str(alternate[2]) if len(alternate) > 2 else "api"
-                path_kind = str(alternate[3]) if len(alternate) > 3 else auth_method
-                plan_tier = auth_method
-                break
-    if auth_method == "subscription" and provider == str(decision.get("provider") or "").lower():
-        pools = metadata.get("required_subscription_pools") or []
-        specific_pools = [pool for pool in pools if not str(pool).endswith("_subscription")]
-        if specific_pools:
-            plan_tier = str(specific_pools[0])
+    provider = str(result.get("provider_used") or "").lower()
+    model = str(result.get("model_used") or "")
+    try:
+        executed = next(
+            entry
+            for entry in _decision_execution_entries(decision)
+            if entry["provider"] == provider and entry["model"] == model
+        )
+    except (StopIteration, ValueError) as exc:
+        print(f"[zc-worker] fatal: execution identity is outside the KNEMON decision: {exc}", flush=True)
+        _fatal_error = True
+        _running = False
+        return False
+    auth_method = executed["auth_method"]
+    path_kind = executed["path_kind"]
+    plan_tier = executed["plan_name"] or auth_method
     error_text = str(result.get("error") or result.get("stderr") or "").lower()
     outcome = "ok" if status == "done" else ("timeout" if "timeout" in error_text else "err")
     body = {
@@ -547,6 +548,21 @@ def record_knemon_usage(job: dict, result: dict, status: str) -> bool:
             if exc.code in (401, 403):
                 _fatal_auth("KNEMON ledger reconciliation", exc.code)
                 return False
+            if exc.code == 409:
+                try:
+                    detail = str((json.loads(exc.read()) or {}).get("detail") or "").lower()
+                except Exception:
+                    detail = ""
+                # A completed execution can be reclaimed after Hive acknowledgement
+                # failed. KNEMON rolls the duplicate ledger insert back and reports
+                # the already-reconciled reservation; that is the original success.
+                stable_execution_id = f"stiphos-job:{job.get('id')}"
+                if (
+                    " is 'reconciled'" in detail
+                    and result.get("_stiphos_execution_complete") is True
+                    and result.get("execution_id") == stable_execution_id
+                ):
+                    return True
             if 400 <= exc.code < 500:
                 print(f"[zc-worker] fatal KNEMON ledger rejection: HTTP {exc.code}", flush=True)
                 _fatal_error = True
@@ -848,8 +864,12 @@ def _provider_to_alias(prov: str) -> str:
     mapping = {
         "ngc_integrate": _PRIMARY_BC,  # per-instance hive_nvidia_<N>
         "ngc_inference": _PRIMARY_BC,
+        "ngc": _PRIMARY_BC,
+        "nvidia": _PRIMARY_BC,
         "groq": "hive_groq_8b",
         "deepseek_direct": f"hive_deepseek_{_INST}",
+        "deepseek-direct": f"hive_deepseek_{_INST}",
+        "deepseek": f"hive_deepseek_{_INST}",
         "siliconflow": f"hive_siliconflow_{_INST}",
         "together": _FALLBACK_TOGETHER,
         "xai": "hive_xai",
@@ -858,6 +878,87 @@ def _provider_to_alias(prov: str) -> str:
         "gemini": "hive_gemini",
     }
     return mapping.get(prov, "")
+
+
+def _decision_execution_entries(decision: dict) -> list[dict]:
+    """Normalize the KNEMON primary and authorized fallbacks for execution.
+
+    Subscription accounting identity is not inferable from ``auth_method``.
+    Until KNEMON supplies an exact plan name on a subscription fallback, that
+    fallback is intentionally unavailable rather than charged to a fake tier.
+    """
+    if not isinstance(decision, dict):
+        raise ValueError("missing KNEMON decision")
+
+    raw_entries = [
+        {
+            "provider": decision.get("provider"),
+            "model": decision.get("model_id"),
+            "auth_method": decision.get("auth_method", "api"),
+            "path_kind": decision.get("path_kind") or decision.get("auth_method", "api"),
+            "plan_name": decision.get("plan_name", ""),
+        }
+    ]
+    for raw in decision.get("fallback_chain") or []:
+        if isinstance(raw, dict):
+            raw_entries.append(
+                {
+                    "provider": raw.get("provider"),
+                    "model": raw.get("model_id") or raw.get("model"),
+                    "auth_method": raw.get("auth_method", "api"),
+                    "path_kind": raw.get("path_kind") or raw.get("auth_method", "api"),
+                    "plan_name": raw.get("plan_name", ""),
+                }
+            )
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            auth_method = str(raw[2]) if len(raw) > 2 else "api"
+            raw_entries.append(
+                {
+                    "provider": raw[0],
+                    "model": raw[1],
+                    "auth_method": auth_method,
+                    "path_kind": str(raw[3]) if len(raw) > 3 else auth_method,
+                    # KNEMON tuple v1 has cost at index 4; v2 appends plan_name.
+                    "plan_name": str(raw[5]) if len(raw) > 5 and raw[5] else "",
+                }
+            )
+
+    entries: list[dict] = []
+    for index, raw in enumerate(raw_entries):
+        provider = str(raw.get("provider") or "").strip().lower()
+        model = str(raw.get("model") or "").strip()
+        auth_method = str(raw.get("auth_method") or "api").strip().lower()
+        path_kind = str(raw.get("path_kind") or auth_method).strip().lower()
+        plan_name = str(raw.get("plan_name") or "").strip()
+        if not provider or not model:
+            if index == 0:
+                raise ValueError("KNEMON primary is missing provider/model")
+            continue
+        if auth_method == "subscription" and not plan_name:
+            if index == 0:
+                raise ValueError("KNEMON subscription primary is missing plan_name")
+            continue
+        alias = _provider_to_alias(provider)
+        if auth_method == "subscription":
+            alias_env = f"ZC_DECISION_ALIAS_{_pool_slug(provider).upper()}_{_pool_slug(path_kind).upper()}"
+            alias = os.environ.get(alias_env, "").strip()
+        if not alias:
+            if index == 0:
+                raise ValueError(
+                    f"no ZeroClaw alias for KNEMON provider/path {provider!r}/{path_kind!r}"
+                )
+            continue
+        entry = {
+            "alias": alias,
+            "provider": provider,
+            "model": model,
+            "auth_method": auth_method,
+            "path_kind": path_kind,
+            "plan_name": plan_name,
+        }
+        if (provider, model) not in {(item["provider"], item["model"]) for item in entries}:
+            entries.append(entry)
+    return entries
 
 
 def _build_tier_chain(tier: str) -> list:
@@ -1007,7 +1108,12 @@ def _is_rate_limited(stderr: str, stdout: str = "") -> bool:
 
 
 def run_zeroclaw(
-    description: str, kind: str = "", job_id: str = "", job_heartbeat_fn=None, max_cost_tier: str = "C"
+    description: str,
+    kind: str = "",
+    job_id: str = "",
+    job_heartbeat_fn=None,
+    max_cost_tier: str = "C",
+    routing_decision: dict | None = None,
 ) -> dict:
     """Execute one job. If description starts with [repo:...] directive,
     clone + checkout + run agent in workspace + commit/push changes.
@@ -1016,13 +1122,18 @@ def run_zeroclaw(
     --provider override is ALWAYS passed (per-tier) to bypass zeroclaw 0.8
     `[agents.<alias>] model_provider` dangling-reference validation; CLI
     override resolves correctly even when config validate flags it."""
+    decision_entries = _decision_execution_entries(routing_decision) if routing_decision else None
     repo = _parse_repo_directive(description)
     workspace = None
     branch = None
     if repo:
         # Workspace path is per-agent-alias; use first chain entry (final_provider may
         # change on rate-limit but workspace is shared across all chain attempts)
-        first_alias = TIER_FALLBACK_CHAIN.get((max_cost_tier or "C").upper(), TIER_FALLBACK_CHAIN["C"])[0]
+        first_alias = (
+            decision_entries[0]["alias"]
+            if decision_entries
+            else TIER_FALLBACK_CHAIN.get((max_cost_tier or "C").upper(), TIER_FALLBACK_CHAIN["C"])[0]
+        )
         try:
             workspace = _prepare_workspace(job_id or "anon", repo, agent_alias=first_alias)
         except Exception as exc:
@@ -1037,22 +1148,30 @@ def run_zeroclaw(
     exec_cwd = workspace or WORKDIR
 
     tier = (max_cost_tier or "C").upper()
-    chain = TIER_FALLBACK_CHAIN.get(tier, TIER_FALLBACK_CHAIN["C"])
+    chain = [entry["alias"] for entry in decision_entries] if decision_entries else TIER_FALLBACK_CHAIN.get(tier, TIER_FALLBACK_CHAIN["C"])
     start = time.time()
     timeout = timeout_for_kind(kind)
     last_stderr = ""
     last_stdout = ""
     providers_attempted = []
     final_provider = chain[0]
+    final_entry = decision_entries[0] if decision_entries else None
     proc = None
 
     for attempt_idx, agent_alias in enumerate(chain):
         final_provider = agent_alias
+        final_entry = decision_entries[attempt_idx] if decision_entries else None
         providers_attempted.append(agent_alias)
         # Switch -a <agent_alias> per attempt; each agent binds to single
         # provider type via its model_provider field. Avoids 0.8 bug where
         # --provider override keeps old agent's api_key.
-        cmd = [ZEROCLAW_BIN, "agent", "-a", agent_alias, "-m", description]
+        cmd = [ZEROCLAW_BIN, "agent", "-a", agent_alias]
+        if final_entry:
+            # Keep the alias for its provider credentials/endpoint, but pin the
+            # exact KNEMON-authorized model instead of whatever model the local
+            # alias happens to default to.
+            cmd.extend(["--model", final_entry["model"]])
+        cmd.extend(["-m", description])
         print(
             f"[zc-worker] $ {' '.join(cmd[:4])} … [desc len={len(description)}] cwd={exec_cwd} (attempt {attempt_idx+1}/{len(chain)})",
             flush=True,
@@ -1150,7 +1269,11 @@ def run_zeroclaw(
         "duration_sec": round(time.time() - start, 1),
         "zeroclaw_cmd": f"{ZEROCLAW_BIN} agent -a {final_provider}",
         "agent_alias": final_provider,
-        "provider_used": _alias_to_provider(final_provider),
+        "provider_used": final_entry["provider"] if final_entry else _alias_to_provider(final_provider),
+        "model_used": final_entry["model"] if final_entry else AGENT_MODEL,
+        "auth_method_used": final_entry["auth_method"] if final_entry else "unknown",
+        "path_kind_used": final_entry["path_kind"] if final_entry else "unknown",
+        "plan_name_used": final_entry["plan_name"] if final_entry else "",
         "providers_attempted": providers_attempted,
         "tokens_in": t_in,
         "tokens_out": t_out,
@@ -1209,17 +1332,51 @@ def main():
         def _job_hb(elapsed):
             update_job(job_id, "running", {"heartbeat_at": time.time(), "elapsed_sec": elapsed})
 
-        result = run_zeroclaw(
-            job.get("description") or job.get("kind", ""),
-            job.get("kind", ""),
-            job_id=job["id"],
-            job_heartbeat_fn=_job_hb,
-            max_cost_tier=job.get("max_cost_tier") or job.get("cost_tier") or "B",
-        )
+        saved_result = job.get("result") if isinstance(job.get("result"), dict) else None
+        if saved_result and saved_result.get("_stiphos_execution_complete") is True:
+            result = dict(saved_result)
+            print(f"[zc-worker] resuming acknowledgements for completed job {job['id'][:8]}", flush=True)
+        else:
+            metadata = job.get("routing_metadata") or {}
+            decision = metadata.get("decision") if isinstance(metadata, dict) else None
+            try:
+                result = run_zeroclaw(
+                    job.get("description") or job.get("kind", ""),
+                    job.get("kind", ""),
+                    job_id=job["id"],
+                    job_heartbeat_fn=_job_hb,
+                    max_cost_tier=job.get("max_cost_tier") or job.get("cost_tier") or "B",
+                    routing_decision=decision,
+                )
+                result.setdefault("provider_used", str((decision or {}).get("provider") or AGENT_PROVIDER).lower())
+                result.setdefault("model_used", str((decision or {}).get("model_id") or AGENT_MODEL))
+            except ValueError as exc:
+                result = {
+                    "exit_code": 1,
+                    "error": f"invalid KNEMON execution decision: {exc}",
+                    "provider_used": str((decision or {}).get("provider") or AGENT_PROVIDER).lower(),
+                    "model_used": str((decision or {}).get("model_id") or AGENT_MODEL),
+                    "execution_skipped": True,
+                }
+            if result.get("execution_skipped") is True:
+                result["finished_at"] = time.time()
+                if not update_job(job["id"], "failed", result, require_ack=True) and not _running:
+                    break
+                continue
+            result["_stiphos_execution_complete"] = True
+            result["execution_id"] = f"stiphos-job:{job['id']}"
+            # This acknowledgement is the durable execution boundary. If later
+            # cross-service calls fail, the reaper may requeue the job but the
+            # next worker resumes from this result instead of invoking a model.
+            if not update_job(job["id"], "running", result, require_ack=True):
+                if not _running:
+                    break
+                continue
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
         if not record_knemon_usage(job, result, status):
             break
+        result["knemon_reconciled"] = True
         if not update_job(job["id"], status, result, require_ack=True):
             if not _running:
                 break

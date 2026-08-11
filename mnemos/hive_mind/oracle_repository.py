@@ -949,11 +949,13 @@ class OracleHiveMindRepository(HiveMindRepository):
                         requested_tier = existing[0]
                 except ValueError:
                     requested_tier = existing[0]
+            merged_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            merged_metadata.update(kwargs.get("routing_metadata") or {})
             fields = ["routed_at=:routed_at", "routing_metadata=:routing_metadata"]
             params: dict[str, Any] = {
                 "id": _uuid_to_raw(job_id),
                 "routed_at": _ts_to_tstz(routed_at),
-                "routing_metadata": _json_dumps(kwargs.get("routing_metadata") or {}),
+                "routing_metadata": _json_dumps(merged_metadata),
             }
             for column in (
                 "required_capabilities",

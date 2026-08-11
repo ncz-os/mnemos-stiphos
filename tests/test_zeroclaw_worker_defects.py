@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -240,10 +241,174 @@ def test_knemon_reservation_is_reconciled_with_execution_usage(monkeypatch: pyte
     }
 
     assert worker.record_knemon_usage(
-        job, {"provider_used": "groq", "tokens_in": 10, "tokens_out": 2, "duration_sec": 1.5}, "done"
+        job,
+        {"provider_used": "groq", "model_used": "qwen", "tokens_in": 10, "tokens_out": 2, "duration_sec": 1.5},
+        "done",
     )
     assert captured["url"] == "http://mnemos.test/v1/ledger"
     assert captured["body"]["reservation_id"] == "r" * 36
     assert captured["body"]["session_id"] == "stiphos-job:job-1"
     assert captured["body"]["outcome"] == "ok"
     assert captured["authorization"] == "Bearer secret"
+
+
+def test_knemon_decision_is_the_exclusive_execution_chain() -> None:
+    entries = worker._decision_execution_entries(
+        {
+            "provider": "gemini",
+            "model_id": "gemini-2.5-flash",
+            "auth_method": "api",
+            "path_kind": "api",
+            "fallback_chain": [
+                ["groq", "qwen3-32b", "api", "api", 0.1],
+                ["xai", "grok-4.1-fast", "api", "api", 0.2],
+            ],
+        }
+    )
+
+    assert [(entry["provider"], entry["model"]) for entry in entries] == [
+        ("gemini", "gemini-2.5-flash"),
+        ("groq", "qwen3-32b"),
+        ("xai", "grok-4.1-fast"),
+    ]
+    assert not {"anthropic", "openai"} & {entry["provider"] for entry in entries}
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"],
+)
+def test_every_knemon_zeroclaw_provider_has_an_execution_alias(provider: str) -> None:
+    entries = worker._decision_execution_entries(
+        {"provider": provider, "model_id": "authorized-model", "auth_method": "api", "path_kind": "api"}
+    )
+    assert entries[0]["provider"] == provider
+    assert entries[0]["alias"]
+
+
+def test_subscription_fallback_requires_exact_plan_and_path_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZC_DECISION_ALIAS_OPENAI_CODEX", "hive_codex_subscription")
+    entries = worker._decision_execution_entries(
+        {
+            "provider": "groq",
+            "model_id": "qwen3-32b",
+            "auth_method": "api",
+            "fallback_chain": [
+                ["openai", "gpt-5", "subscription", "codex", 0.0],
+                ["openai", "gpt-5-mini", "subscription", "codex", 0.0, "codex_pro_200"],
+            ],
+        }
+    )
+
+    assert [(entry["model"], entry["plan_name"]) for entry in entries] == [
+        ("qwen3-32b", ""),
+        ("gpt-5-mini", "codex_pro_200"),
+    ]
+
+
+def test_run_uses_only_decision_aliases_and_pins_exact_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands = []
+
+    class Process:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def fake_popen(cmd, *, cwd, stdout, stderr, text, env):
+        commands.append(cmd)
+        if len(commands) == 1:
+            stderr.write(b"rate limit exceeded")
+            stderr.flush()
+            return Process(1)
+        return Process(0)
+
+    monkeypatch.setattr(worker.subprocess, "Popen", fake_popen)
+    result = worker.run_zeroclaw(
+        "review",
+        routing_decision={
+            "provider": "gemini",
+            "model_id": "gemini-2.5-flash",
+            "auth_method": "api",
+            "fallback_chain": [["groq", "qwen3-32b", "api", "api", 0.1]],
+        },
+    )
+
+    assert [cmd[cmd.index("--model") + 1] for cmd in commands] == ["gemini-2.5-flash", "qwen3-32b"]
+    assert [cmd[cmd.index("-a") + 1] for cmd in commands] == ["hive_gemini", "hive_groq_8b"]
+    assert result["provider_used"] == "groq"
+    assert result["model_used"] == "qwen3-32b"
+
+
+def test_reconciled_reservation_conflict_is_idempotent_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    conflict = urllib.error.HTTPError("http://mnemos.test/v1/ledger", 409, "conflict", {}, None)
+    conflict.read = lambda: json.dumps({"detail": "burn reservation abc is 'reconciled', expected 'pending'"}).encode()
+    monkeypatch.setattr(worker, "MNEMOS_TOKEN", "secret")
+    monkeypatch.setattr(worker.urllib.request, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(conflict))
+    monkeypatch.setattr(worker, "_running", True)
+    monkeypatch.setattr(worker, "_fatal_error", False)
+    job = {
+        "id": "job-1",
+        "kind": "review",
+        "routing_metadata": {
+            "decision": {
+                "provider": "groq",
+                "model_id": "qwen",
+                "auth_method": "api",
+                "reservation_id": "r" * 36,
+            }
+        },
+    }
+
+    assert worker.record_knemon_usage(
+        job,
+        {
+            "provider_used": "groq",
+            "model_used": "qwen",
+            "_stiphos_execution_complete": True,
+            "execution_id": "stiphos-job:job-1",
+        },
+        "done",
+    )
+    assert worker._running is True
+    assert worker._fatal_error is False
+
+
+def test_execution_result_is_persisted_before_cross_service_acknowledgements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    job = {"id": "job-12345678", "kind": "review", "description": "review", "routing_metadata": {}}
+    claims = iter([job, None])
+
+    monkeypatch.setattr(worker, "register", lambda: "urn:worker")
+    monkeypatch.setattr(worker, "heartbeat", lambda: None)
+    monkeypatch.setattr(worker, "claim_next_job", lambda: next(claims))
+    monkeypatch.setattr(worker.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        worker,
+        "run_zeroclaw",
+        lambda *_args, **_kwargs: {
+            "exit_code": 0,
+            "provider_used": "ngc",
+            "model_used": "kimi",
+        },
+    )
+
+    def fake_update(_job_id, status, result, require_ack=False):
+        events.append(("hive", status, dict(result)))
+        if status == "done":
+            worker._running = False
+        return True
+
+    monkeypatch.setattr(worker, "update_job", fake_update)
+    monkeypatch.setattr(worker, "record_knemon_usage", lambda *_args: (events.append(("ledger",)) or True))
+    monkeypatch.setattr(worker, "_running", True)
+    monkeypatch.setattr(worker, "_fatal_error", False)
+
+    assert worker.main() == 0
+    ledger_index = events.index(("ledger",))
+    durable = [event for event in events[:ledger_index] if event[0:2] == ("hive", "running")]
+    assert durable[-1][2]["_stiphos_execution_complete"] is True
+    assert events[-1][0:2] == ("hive", "done")

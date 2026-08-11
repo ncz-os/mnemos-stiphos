@@ -48,7 +48,7 @@ CREATE TABLE jobs (
   submitter_urn         VARCHAR2(256) NOT NULL,
   parent_job_id         RAW(16),
   kind                  VARCHAR2(64) NOT NULL,
-  description           VARCHAR2(4000),
+  description           CLOB,
   priority              NUMBER(5) DEFAULT 0 NOT NULL,
   deadline              TIMESTAMP WITH TIME ZONE,
   required_capabilities CLOB CHECK (required_capabilities IS JSON),

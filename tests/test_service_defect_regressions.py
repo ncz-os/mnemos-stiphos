@@ -62,7 +62,11 @@ def test_retryable_failure_is_counted_for_original_worker(monkeypatch, tmp_path)
         worker_urn, job_id = _register_and_create(client, max_retries=1)
         response = client.patch(
             f"/v1/jobs/{job_id}",
-            json={"status": "failed", "claimed_by": worker_urn, "result": {"exit_code": 1}},
+            json={
+                "status": "failed",
+                "claimed_by": worker_urn,
+                "result": {"exit_code": 1, "provider_used": "ngc", "model_used": "unknown"},
+            },
         )
         assert response.status_code == 200, response.text
 
@@ -84,7 +88,7 @@ def test_reported_provider_is_revalidated_and_used_for_accounting(monkeypatch, t
                 "claimed_by": worker_urn,
                 "tokens_in": 100,
                 "tokens_out": 50,
-                "result": {"exit_code": 0, "provider_used": "openai"},
+                "result": {"exit_code": 0, "provider_used": "openai", "model_used": "gpt-5"},
             },
         )
         assert response.status_code == 200, response.text
@@ -123,7 +127,11 @@ def test_stale_worker_cannot_overwrite_requeued_job(monkeypatch, tmp_path) -> No
             )
         response = client.patch(
             f"/v1/jobs/{job_id}",
-            json={"status": "done", "claimed_by": worker_urn, "result": {"exit_code": 0}},
+            json={
+                "status": "done",
+                "claimed_by": worker_urn,
+                "result": {"exit_code": 0, "provider_used": "ngc", "model_used": "unknown"},
+            },
         )
 
     assert response.status_code == 409
@@ -168,7 +176,11 @@ def test_cache_equivalence_includes_context(monkeypatch, tmp_path) -> None:
         assert client.post(f"/v1/jobs/next?agent_urn={worker['urn']}").status_code == 200
         assert client.patch(
             f"/v1/jobs/{job_id}",
-            json={"status": "done", "claimed_by": worker["urn"], "result": {"exit_code": 0}},
+            json={
+                "status": "done",
+                "claimed_by": worker["urn"],
+                "result": {"exit_code": 0, "provider_used": "ngc", "model_used": "unknown"},
+            },
         ).status_code == 200
         second = client.post(
             "/v1/jobs",
@@ -202,3 +214,142 @@ def test_cache_equivalence_distinguishes_explicit_default_cost_cap() -> None:
     omitted = service.cache_key_for("review", "same", "A", None, max_cost_tier_explicit=False)
     explicit = service.cache_key_for("review", "same", "A", None, max_cost_tier_explicit=True)
     assert omitted != explicit
+
+
+def test_cache_is_off_by_default_even_for_identical_successful_jobs(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "cache-default-off.sqlite3")
+    with TestClient(service.app) as client:
+        submitter = client.post("/v1/agents/register", json={"runtime": "claude-code", "host": "studio"}).json()
+        worker = client.post(
+            "/v1/agents/register", json={"runtime": "zeroclaw", "host": "worker", "provider": "ngc"}
+        ).json()
+        body = {"submitter_urn": submitter["urn"], "kind": "review", "description": "same pure-looking text"}
+        first = client.post("/v1/jobs", json=body).json()
+        assert client.post(f"/v1/jobs/next?agent_urn={worker['urn']}").status_code == 200
+        assert client.patch(
+            f"/v1/jobs/{first['id']}",
+            json={
+                "status": "done",
+                "claimed_by": worker["urn"],
+                "result": {"exit_code": 0, "provider_used": "ngc", "model_used": "unknown"},
+            },
+        ).status_code == 200
+        second = client.post("/v1/jobs", json=body)
+
+    assert second.status_code == 200
+    assert second.json().get("cache_hit") is not True
+
+
+def test_cacheable_repository_job_requires_immutable_identity(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "cache-repo-identity.sqlite3")
+    with TestClient(service.app) as client:
+        response = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": "human",
+                "kind": "code-edit",
+                "description": "[repo:https://example.test/repo base:main] edit",
+                "cacheable": True,
+                "pure": True,
+                "idempotent": True,
+            },
+        )
+    assert response.status_code == 422
+    assert "immutable commit hash" in response.text
+
+
+def test_cache_opt_in_requires_explicit_pure_and_idempotent(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "cache-declarations.sqlite3")
+    with TestClient(service.app) as client:
+        response = client.post(
+            "/v1/jobs",
+            json={"submitter_urn": "human", "kind": "review", "description": "same", "cacheable": True},
+        )
+    assert response.status_code == 422
+    assert "pure=true and idempotent=true" in response.text
+
+
+def test_explicit_pure_idempotent_job_can_use_cache(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "cache-explicit.sqlite3")
+    with TestClient(service.app) as client:
+        submitter = client.post("/v1/agents/register", json={"runtime": "claude-code", "host": "studio"}).json()
+        worker = client.post(
+            "/v1/agents/register", json={"runtime": "zeroclaw", "host": "worker", "provider": "ngc"}
+        ).json()
+        body = {
+            "submitter_urn": submitter["urn"],
+            "kind": "pure-summary",
+            "description": "summarize immutable input",
+            "cacheable": True,
+            "pure": True,
+            "idempotent": True,
+        }
+        first = client.post("/v1/jobs", json=body).json()
+        assert client.post(f"/v1/jobs/next?agent_urn={worker['urn']}").status_code == 200
+        assert client.patch(
+            f"/v1/jobs/{first['id']}",
+            json={
+                "status": "done",
+                "claimed_by": worker["urn"],
+                "result": {"exit_code": 0, "provider_used": "ngc", "model_used": "unknown"},
+            },
+        ).status_code == 200
+        second = client.post("/v1/jobs", json=body)
+
+    assert second.status_code == 200
+    assert second.json()["cache_hit"] is True
+
+
+def test_requeue_clears_claim_and_terminal_state(monkeypatch, tmp_path) -> None:
+    db_path = _configure_service(monkeypatch, tmp_path, "explicit-requeue.sqlite3")
+    with TestClient(service.app) as client:
+        worker_urn, job_id = _register_and_create(client)
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE jobs SET result='{}', ended_at=1, tokens_in=2, estimated_cost_usd=3 WHERE id=?",
+                (job_id,),
+            )
+        response = client.patch(
+            f"/v1/jobs/{job_id}",
+            json={"status": "queued", "claimed_by": worker_urn, "result": {"obsolete": True}},
+        )
+    assert response.status_code == 200, response.text
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT status,claimed_by,claimed_at,result,ended_at,tokens_in,estimated_cost_usd FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    assert row == ("queued", None, None, None, None, None, None)
+
+
+def test_terminal_result_identity_is_required(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "identity-required.sqlite3")
+    with TestClient(service.app) as client:
+        worker_urn, job_id = _register_and_create(client)
+        response = client.patch(
+            f"/v1/jobs/{job_id}",
+            json={"status": "done", "claimed_by": worker_urn, "result": {"exit_code": 0}},
+        )
+    assert response.status_code == 422
+    assert "provider_used and model_used" in response.text
+
+
+def test_terminal_identity_must_match_knemon_decision(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "identity-authorized.sqlite3")
+    with TestClient(service.app) as client:
+        worker_urn, job_id = _register_and_create(client, max_cost_tier="C")
+        with sqlite3.connect(service.DB_PATH) as db:
+            db.execute(
+                "UPDATE jobs SET routing_metadata=? WHERE id=?",
+                ('{"decision":{"provider":"groq","model_id":"qwen","fallback_chain":[]}}', job_id),
+            )
+        response = client.patch(
+            f"/v1/jobs/{job_id}",
+            json={
+                "status": "done",
+                "claimed_by": worker_urn,
+                "result": {"exit_code": 0, "provider_used": "openai", "model_used": "gpt-5"},
+            },
+        )
+    assert response.status_code == 409
+    assert "outside the authorized KNEMON decision" in response.text

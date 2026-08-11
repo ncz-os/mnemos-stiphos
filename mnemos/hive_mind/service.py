@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -471,12 +472,13 @@ def cache_key_for(
     mnemos_refs: Optional[list[str]] = None,
     depends_on: Optional[list[str]] = None,
     max_cost_tier_explicit: Optional[bool] = None,
+    cache_context: Optional[str] = None,
 ) -> str:
     # Versioned canonical representation: every field that can affect routing,
     # available context, or the worker-visible job is part of equivalence.
     payload = json.dumps(
         {
-            "schema": 3,
+            "schema": 4,
             "kind": kind,
             "description": (description or "").strip(),
             "max_cost_tier": max_cost_tier,
@@ -492,6 +494,7 @@ def cache_key_for(
             "mnemos_refs": mnemos_refs or [],
             "depends_on": depends_on or [],
             "max_cost_tier_explicit": max_cost_tier_explicit,
+            "cache_context": cache_context,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -643,10 +646,20 @@ class JobCreate(BaseModel):
     mnemos_refs: Optional[list[str]] = None  # mem_XXX ids — context/handoffs/related work the worker should consult
     # DAG support:
     depends_on: Optional[list[str]] = None  # job ids that must be status='done' before this job is dequeueable
+    cacheable: bool = Field(
+        False,
+        description="Opt into caching after also declaring the job pure and idempotent.",
+    )
+    pure: bool = Field(False, description="The result has no external side effects or mutable-state dependency.")
+    idempotent: bool = Field(False, description="Repeated evaluation is contractually equivalent.")
+    cache_context: Optional[str] = Field(
+        None,
+        description="Immutable dependency/toolchain identity required when repository work opts into caching.",
+    )
 
 
 class JobUpdate(BaseModel):
-    status: str
+    status: str = Field(pattern=r"^(queued|claimed|running|done|failed|cancelled)$")
     result: Optional[dict] = None
     claimed_by: Optional[str] = None
     tokens_in: Optional[int] = None  # workers SHOULD report token usage on done/failed for cost audit
@@ -1210,6 +1223,16 @@ async def create_job(req: JobCreate):
     """
     job_id = uuidv7()
     now = time.time()
+    repo_directive = re.match(r"^\s*\[repo:(?P<body>[^]]+)\]", req.description or "", re.IGNORECASE)
+    if req.cacheable and not (req.pure and req.idempotent):
+        raise HTTPException(422, "cacheable jobs must explicitly declare pure=true and idempotent=true")
+    if req.cacheable and repo_directive:
+        base_match = re.search(r"(?:^|\s)base:([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?:\s|$)", repo_directive.group("body"))
+        if not base_match or not req.cache_context:
+            raise HTTPException(
+                422,
+                "cacheable repository jobs require base:<full immutable commit hash> and cache_context dependency/toolchain identities",
+            )
     if req.mnemos_refs:
         bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
         if bad:
@@ -1260,9 +1283,10 @@ async def create_job(req: JobCreate):
         mnemos_refs=req.mnemos_refs,
         depends_on=req.depends_on,
         max_cost_tier_explicit="max_cost_tier" in getattr(req, "model_fields_set", set()),
+        cache_context=req.cache_context,
     )
     async with aiosqlite.connect(DB_PATH) as db:
-        cached = await cache_lookup(db, ck)
+        cached = await cache_lookup(db, ck) if req.cacheable else None
         if cached:
             # Phase 2 cut 3: cache-hit insert delegated to repo. Cache-hit
             # accounting (cache_record_hit) stays inline because it needs
@@ -1338,7 +1362,9 @@ async def create_job(req: JobCreate):
             max_retries=req.max_retries,
             started_at=now,
             routing_metadata={
-                "submitter_max_cost_tier_explicit": "max_cost_tier" in getattr(req, "model_fields_set", set())
+                "submitter_max_cost_tier_explicit": "max_cost_tier" in getattr(req, "model_fields_set", set()),
+                "cacheable": req.cacheable,
+                "cache_context": req.cache_context,
             },
         )
         await emit_event(
@@ -1410,19 +1436,58 @@ async def dequeue_next_job(agent_urn: str):
 @app.patch("/v1/jobs/{job_id}")
 async def update_job(job_id: str, req: JobUpdate):
     now = time.time()
+    async with aiosqlite.connect(DB_PATH) as state_db:
+        async with state_db.execute(
+            "SELECT status, claimed_by, max_cost_tier, routing_metadata FROM jobs WHERE id=?", (job_id,)
+        ) as state_cur:
+            state_row = await state_cur.fetchone()
+    if not state_row:
+        raise HTTPException(404, f"job not found: {job_id}")
+    current_status, current_claimer, current_cap, routing_metadata_json = state_row
+    allowed_transitions = {
+        "queued": {"claimed", "cancelled"},
+        "offered": {"claimed", "queued", "cancelled"},
+        "claimed": {"running", "queued", "done", "failed", "cancelled"},
+        "running": {"running", "queued", "done", "failed", "cancelled"},
+        "done": set(),
+        "failed": {"queued"},
+        "cancelled": set(),
+    }
+    if req.status != current_status and req.status not in allowed_transitions.get(current_status, set()):
+        raise HTTPException(409, f"invalid job transition: {current_status} -> {req.status}")
+    if req.claimed_by and current_claimer and req.claimed_by != current_claimer:
+        raise HTTPException(409, "job is owned by a different worker")
+
     reported_provider = None
+    reported_model = None
     reported_tier = None
-    if req.result and req.result.get("provider_used"):
+    if req.status in ("done", "failed"):
+        if not isinstance(req.result, dict) or not req.result.get("provider_used") or not req.result.get("model_used"):
+            raise HTTPException(422, "terminal results require provider_used and model_used")
         reported_provider = str(req.result["provider_used"]).lower()
+        reported_model = str(req.result["model_used"])
         reported_tier = cost_tier_for(reported_provider)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT max_cost_tier FROM jobs WHERE id=?", (job_id,)) as cur:
-                cap_row = await cur.fetchone()
-        if cap_row and reported_tier not in COST_TIERS[: COST_TIERS.index(cap_row[0]) + 1]:
+        routing_metadata = json.loads(routing_metadata_json) if routing_metadata_json else {}
+        decision = routing_metadata.get("decision") if isinstance(routing_metadata, dict) else None
+        if isinstance(decision, dict):
+            authorized = {(str(decision.get("provider") or "").lower(), str(decision.get("model_id") or ""))}
+            for alternate in decision.get("fallback_chain") or []:
+                if isinstance(alternate, dict):
+                    authorized.add(
+                        (
+                            str(alternate.get("provider") or "").lower(),
+                            str(alternate.get("model_id") or alternate.get("model") or ""),
+                        )
+                    )
+                elif isinstance(alternate, (list, tuple)) and len(alternate) >= 2:
+                    authorized.add((str(alternate[0]).lower(), str(alternate[1])))
+            if (reported_provider, reported_model) not in authorized:
+                raise HTTPException(409, "reported provider/model is outside the authorized KNEMON decision")
+        if reported_tier not in COST_TIERS[: COST_TIERS.index(current_cap) + 1]:
             patched = dict(req.result)
             patched["exit_code"] = 1
             patched["failure_reason"] = (
-                f"cost_tier_violation: provider={reported_provider} tier={reported_tier} exceeds cap={cap_row[0]}"
+                f"cost_tier_violation: provider={reported_provider} tier={reported_tier} exceeds cap={current_cap}"
             )
             req = JobUpdate(
                 status="failed",
@@ -1452,22 +1517,30 @@ async def update_job(job_id: str, req: JobUpdate):
             )
     fields = ["status=?"]
     args: list = [req.status]
+    if req.status == "queued":
+        fields.extend(
+            [
+                "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL", "claimed_model=NULL",
+                "claimed_provider=NULL", "claimed_cost_tier=NULL", "ended_at=NULL", "result=NULL",
+                "result_mnemos_id=NULL", "tokens_in=NULL", "tokens_out=NULL", "estimated_cost_usd=NULL",
+            ]
+        )
     if req.status in ("done", "failed", "cancelled"):
         fields.append("ended_at=?")
         args.append(now)
-    if req.result is not None:
+    if req.result is not None and req.status != "queued":
         fields.append("result=?")
         args.append(json.dumps(req.result))
-    if req.claimed_by:
+    if req.claimed_by and req.status != "queued":
         fields.extend(["claimed_by=?", "claimed_at=?"])
         args.extend([req.claimed_by, now])
     if reported_provider:
-        fields.extend(["claimed_provider=?", "claimed_cost_tier=?"])
-        args.extend([reported_provider, reported_tier])
+        fields.extend(["claimed_provider=?", "claimed_model=?", "claimed_cost_tier=?"])
+        args.extend([reported_provider, reported_model, reported_tier])
     # token usage + cost estimation
     cost_estimate = None
     claimed_by_urn = None
-    if req.tokens_in is not None or req.tokens_out is not None:
+    if req.status != "queued" and (req.tokens_in is not None or req.tokens_out is not None):
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT claimed_provider, claimed_model, claimed_by FROM jobs WHERE id=?", (job_id,)
@@ -1477,17 +1550,18 @@ async def update_job(job_id: str, req: JobUpdate):
             prov, mod, claimed_by_urn = row
             if reported_provider:
                 prov = reported_provider
+                mod = reported_model
             t_in = int(req.tokens_in or 0)
             t_out = int(req.tokens_out or 0)
             cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
             fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
             args.extend([t_in, t_out, cost_estimate])
-    args.append(job_id)
+    args.extend([job_id, current_status])
     ownership_guard = ""
     if req.claimed_by:
-        ownership_guard = " AND claimed_by=? AND status IN ('claimed','running')"
+        ownership_guard = " AND claimed_by=?"
         args.append(req.claimed_by)
-    sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?{ownership_guard}"
+    sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status=?{ownership_guard}"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)
         if cur.rowcount == 0:
@@ -1601,10 +1675,14 @@ async def update_job(job_id: str, req: JobUpdate):
                                 "submitter_max_cost_tier_explicit"
                             )
                         ),
+                        cache_context=(
+                            (json.loads(routing_metadata_json) if routing_metadata_json else {}).get("cache_context")
+                        ),
                     )
                     rdict = json.loads(result_j) if result_j else (req.result or {})
                     ec = (rdict or {}).get("exit_code")
-                    if ec == 0 or ec is None:
+                    cache_metadata = json.loads(routing_metadata_json) if routing_metadata_json else {}
+                    if cache_metadata.get("cacheable") is True and (ec == 0 or ec is None):
                         await cache_store(
                             db,
                             ck,

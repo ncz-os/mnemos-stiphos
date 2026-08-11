@@ -34,7 +34,7 @@ BEGIN
 
   create_if_missing('JOBS', q'~CREATE TABLE jobs (
     id RAW(16) PRIMARY KEY, submitter_urn VARCHAR2(256) NOT NULL,
-    parent_job_id RAW(16), kind VARCHAR2(64) NOT NULL, description VARCHAR2(4000),
+    parent_job_id RAW(16), kind VARCHAR2(64) NOT NULL, description CLOB,
     priority NUMBER(5) DEFAULT 0 NOT NULL, deadline TIMESTAMP WITH TIME ZONE,
     required_capabilities CLOB CHECK (required_capabilities IS JSON),
     eligible_kinds CLOB CHECK (eligible_kinds IS JSON), project VARCHAR2(256),
@@ -88,6 +88,37 @@ BEGIN
 END;
 /
 
+-- A prior 002 draft created JOBS.DESCRIPTION as VARCHAR2(4000). Make reruns
+-- repair that populated shape losslessly before copying any remaining legacy
+-- rows. Oracle cannot directly change VARCHAR2 to CLOB, so use a shadow column.
+DECLARE
+  n NUMBER;
+  description_n NUMBER;
+  shadow_n NUMBER;
+  v_data_type user_tab_columns.data_type%TYPE;
+BEGIN
+  SELECT COUNT(*) INTO n FROM user_tables WHERE table_name='JOBS';
+  IF n=1 THEN
+    SELECT COUNT(*) INTO description_n FROM user_tab_columns
+      WHERE table_name='JOBS' AND column_name='DESCRIPTION';
+    SELECT COUNT(*) INTO shadow_n FROM user_tab_columns
+      WHERE table_name='JOBS' AND column_name='DESCRIPTION_CLOB';
+    IF description_n=1 THEN
+      SELECT data_type INTO v_data_type FROM user_tab_columns
+        WHERE table_name='JOBS' AND column_name='DESCRIPTION';
+    END IF;
+    IF description_n=1 AND v_data_type <> 'CLOB' THEN
+      IF shadow_n=0 THEN EXECUTE IMMEDIATE 'ALTER TABLE jobs ADD (description_clob CLOB)'; END IF;
+      EXECUTE IMMEDIATE 'UPDATE jobs SET description_clob=TO_CLOB(description)';
+      EXECUTE IMMEDIATE 'ALTER TABLE jobs DROP COLUMN description';
+      EXECUTE IMMEDIATE 'ALTER TABLE jobs RENAME COLUMN description_clob TO description';
+    ELSIF description_n=0 AND shadow_n=1 THEN
+      EXECUTE IMMEDIATE 'ALTER TABLE jobs RENAME COLUMN description_clob TO description';
+    END IF;
+  END IF;
+END;
+/
+
 -- Copy the actual mnemos-core legacy shapes. MERGE makes reruns safe after a
 -- partially completed copy. Invalid legacy JSON aborts before archival/version.
 DECLARE
@@ -129,13 +160,14 @@ BEGIN
   IF table_exists('MEMORY_JOBS') THEN
     IF column_exists('MEMORY_JOBS','CREATED_AT') THEN
       EXECUTE IMMEDIATE q'~MERGE INTO jobs d USING (
-      SELECT id,submitter_urn,parent_job_id,kind,DBMS_LOB.SUBSTR(description,4000,1) description,
+      SELECT id,submitter_urn,parent_job_id,kind,description,
         NVL(priority,0) priority,eligible_kinds,project,status,claimed_by,
         CAST(NVL(created_at,SYSTIMESTAMP) AS TIMESTAMP WITH TIME ZONE) queued_at,
         CAST(started_at AS TIMESTAMP WITH TIME ZONE) claimed_at,
         CAST(ended_at AS TIMESTAMP WITH TIME ZONE) ended_at,result,
         NVL(retry_count,0) retry_count,NVL(max_retries,2) max_retries
       FROM memory_jobs) s ON (d.id=s.id)
+      WHEN MATCHED THEN UPDATE SET d.description=s.description
       WHEN NOT MATCHED THEN INSERT
         (id,submitter_urn,parent_job_id,kind,description,priority,eligible_kinds,project,
          max_cost_tier,status,claimed_by,claimed_at,started_at,ended_at,result,retry_count,max_retries)
@@ -144,6 +176,7 @@ BEGIN
         s.retry_count,s.max_retries)~';
     ELSIF column_exists('MEMORY_JOBS','REQUIRED_CAPABILITIES') THEN
       EXECUTE IMMEDIATE q'~MERGE INTO jobs d USING (SELECT * FROM memory_jobs) s ON (d.id=s.id)
+      WHEN MATCHED THEN UPDATE SET d.description=s.description
       WHEN NOT MATCHED THEN INSERT
         (id,submitter_urn,parent_job_id,kind,description,priority,deadline,required_capabilities,
          eligible_kinds,project,max_cost_tier,preferred_providers,preferred_models,mnemos_refs,
@@ -224,6 +257,45 @@ BEGIN
     VALUES (s.id,s.name,s.created_by_urn,s.interval_seconds,s.job_template,s.enabled,
       s.last_fired_at,s.next_fire_at,s.fire_count,s.created_at)~';
   END IF;
+END;
+/
+
+-- If the truncating draft already archived MEMORY_JOBS, restore the live CLOB
+-- from that preserved source on rerun.
+DECLARE
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO n FROM user_tables WHERE table_name='LEGACY_MEMORY_JOBS';
+  IF n=1 THEN
+    EXECUTE IMMEDIATE q'~MERGE INTO jobs d
+      USING (SELECT id,description FROM legacy_memory_jobs) s ON (d.id=s.id)
+      WHEN MATCHED THEN UPDATE SET d.description=s.description~';
+  END IF;
+END;
+/
+
+-- Do not archive the source unless every migrated job description has the
+-- same length. This catches truncation from an interrupted/older 002 run.
+DECLARE
+  PROCEDURE validate_descriptions(p_source VARCHAR2) IS
+    mismatch_count NUMBER;
+  BEGIN
+    EXECUTE IMMEDIATE
+      'SELECT COUNT(*) FROM '||DBMS_ASSERT.SIMPLE_SQL_NAME(p_source)||' source '||
+      'LEFT JOIN jobs target ON target.id=source.id '||
+      'WHERE target.id IS NULL OR NVL(LENGTH(source.description),0) <> NVL(LENGTH(target.description),0)'
+      INTO mismatch_count;
+    IF mismatch_count <> 0 THEN
+      RAISE_APPLICATION_ERROR(-20022,
+        'Job description length mismatch after migration from '||p_source||': '||TO_CHAR(mismatch_count));
+    END IF;
+  END;
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO n FROM user_tables WHERE table_name='MEMORY_JOBS';
+  IF n=1 THEN validate_descriptions('MEMORY_JOBS'); END IF;
+  SELECT COUNT(*) INTO n FROM user_tables WHERE table_name='LEGACY_MEMORY_JOBS';
+  IF n=1 THEN validate_descriptions('LEGACY_MEMORY_JOBS'); END IF;
 END;
 /
 

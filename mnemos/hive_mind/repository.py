@@ -504,8 +504,10 @@ class SqliteHiveMindRepository:
                         requested_max_cost_tier = current_tier
                 except ValueError:
                     requested_max_cost_tier = current_tier
+        merged_metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+        merged_metadata.update(kwargs.get("routing_metadata") or {})
         fields = ["routed_at=?", "routing_metadata=?"]
-        args: list[Any] = [float(routed_at), self._json(kwargs.get("routing_metadata") or {})]
+        args: list[Any] = [float(routed_at), self._json(merged_metadata)]
         for column in (
             "required_capabilities",
             "eligible_kinds",

@@ -147,13 +147,25 @@ async def handle_list_tools() -> list[Tool]:
         ),
         Tool(
             name="hive.job_update",
-            description="Update job status/result. Status: queued/claimed/running/done/failed/cancelled.",
+            description=(
+                "Update job status/result. Requeueing atomically clears claim and terminal state. "
+                "Done/failed results require provider_used and model_used."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "status": {"type": "string"},
-                    "result": {"type": "object"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["queued", "claimed", "running", "done", "failed", "cancelled"],
+                    },
+                    "result": {
+                        "type": "object",
+                        "properties": {
+                            "provider_used": {"type": "string"},
+                            "model_used": {"type": "string"},
+                        },
+                    },
                     "claimed_by": {"type": "string"},
                 },
                 "required": ["id", "status"],
