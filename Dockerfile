@@ -39,7 +39,10 @@ RUN MNEMOS_CORE_VERSION="$(python -c 'import importlib.metadata as m; print(m.ve
     python -m pip check && \
     rm -rf /src/stiphos /tmp/core-constraint.txt
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    AGENT_BUS_DB=/data/agents.db
+
+VOLUME ["/data"]
 
 EXPOSE 8080
 

@@ -111,7 +111,14 @@ def _widen_default_cap(job: dict[str, Any], decision: dict[str, Any]) -> str:
 
 def routing_patch_for_decision(job: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     existing_caps = list(job.get("required_capabilities") or [])
-    decision_caps = list(decision.get("dispatch_required_capabilities") or [])
+    # A Zeroclaw worker executes a provider fallback chain. KNEMON's generated
+    # model:* affinity capability describes its preference, not an ability that
+    # must be advertised by the singleton worker registration.
+    decision_caps = [
+        cap
+        for cap in (decision.get("dispatch_required_capabilities") or [])
+        if not str(cap).lower().startswith("model:")
+    ]
     required_capabilities: list[str] = []
     for cap in [*existing_caps, *decision_caps]:
         if cap and cap not in required_capabilities:

@@ -146,6 +146,36 @@ def test_hive_service_claim_respects_required_capabilities(monkeypatch, tmp_path
         assert claimed.status_code == 204, claimed.text
 
 
+def test_hive_service_treats_provider_and_model_preferences_as_soft(monkeypatch, tmp_path) -> None:
+    db_path = str(tmp_path / "hive-service-soft-preferences.sqlite3")
+    monkeypatch.setattr(service, "DB_PATH", db_path)
+    monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
+
+    with TestClient(service.app) as client:
+        worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "zeroclaw", "host": "worker", "provider": "groq",
+                "model": "qwen3-32b", "capabilities": ["cost-tier:A"],
+            },
+        )
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": "external-human",
+                "kind": "research",
+                "eligible_kinds": ["zeroclaw"],
+                "preferred_providers": ["nvidia"],
+                "preferred_models": ["kimi-k2.6"],
+            },
+        )
+        claimed = client.post("/v1/jobs/next", params={"agent_urn": worker.json()["urn"]})
+
+    assert created.status_code == 200
+    assert claimed.status_code == 200
+    assert claimed.json()["id"] == created.json()["id"]
+
+
 def test_hive_routing_patch_enforces_zeroclaw_model_affinity(monkeypatch, tmp_path) -> None:
     db_path = str(tmp_path / "hive-service-routing.sqlite3")
     monkeypatch.setattr(service, "DB_PATH", db_path)

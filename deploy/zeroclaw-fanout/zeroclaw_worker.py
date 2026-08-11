@@ -176,7 +176,7 @@ def _model_capability(provider: str, model: str) -> str:
     return f"model:{safe}" if safe else "model:unknown"
 
 
-for _cap in ("coding", _model_capability(AGENT_PROVIDER, AGENT_MODEL)):
+for _cap in ("coding", "cost-tier:A", _model_capability(AGENT_PROVIDER, AGENT_MODEL)):
     if _cap not in AGENT_CAPABILITIES:
         AGENT_CAPABILITIES.append(_cap)
 
@@ -192,6 +192,7 @@ def timeout_for_kind(kind: str) -> int:
 _urn: str = ""
 _last_heartbeat = 0.0
 _running = True
+_fatal_error = False
 
 
 def _signal_handler(signum, frame):
@@ -425,6 +426,7 @@ def claim_next_job() -> dict | None:
 
 
 def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = False) -> bool:
+    global _running, _fatal_error
     body = {"status": status, "result": result, "claimed_by": _urn}
     if isinstance(result, dict):
         t_in = result.get("tokens_in")
@@ -434,6 +436,7 @@ def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = Fa
         if t_out is not None:
             body["tokens_out"] = int(t_out)
     delay = 1.0
+    server_failures = 0
     while _running:
         code, resp = _http("PATCH", f"/v1/jobs/{job_id}", body)
         if 200 <= code < 300:
@@ -441,6 +444,22 @@ def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = Fa
         print(f"[zc-worker] job update unacknowledged status={status} code={code} resp={resp}", flush=True)
         if not require_ack:
             return False
+        if code in (401, 403):
+            print("[zc-worker] hive authentication rejected; shutting down for credential refresh", flush=True)
+            _fatal_error = True
+            _running = False
+            return False
+        if code in (400, 404, 409, 422) or (400 <= code < 500 and code not in (408, 429)):
+            return False
+        if 500 <= code < 600:
+            server_failures += 1
+            if server_failures >= 5:
+                print("[zc-worker] hive terminal update failed after 5 server responses", flush=True)
+                _fatal_error = True
+                _running = False
+                return False
+        # Keep the registration lease alive while acknowledgement is delayed.
+        heartbeat()
         time.sleep(delay)
         delay = min(delay * 2, 30.0)
     return False
@@ -1068,7 +1087,9 @@ def main():
         backoff = 1.0
         print(f"[zc-worker] claimed job {job['id'][:8]} kind={job['kind']} priority={job.get('priority')}", flush=True)
         if not update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()}, require_ack=True):
-            break
+            if not _running:
+                break
+            continue
         job_id = job["id"]
 
         def _job_hb(elapsed):
@@ -1084,13 +1105,16 @@ def main():
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
         if not update_job(job["id"], status, result, require_ack=True):
-            break
+            if not _running:
+                break
+            continue
         print(
             f"[zc-worker] {status} job {job['id'][:8]} exit={result.get('exit_code')} dur={result.get('duration_sec')}s",
             flush=True,
         )
     print("[zc-worker] clean shutdown", flush=True)
+    return 1 if _fatal_error else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

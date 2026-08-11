@@ -913,14 +913,8 @@ class SqliteHiveMindRepository:
         eligible_kinds = self._loads(row[8], None)
         if eligible_kinds and agent_kind not in set(eligible_kinds):
             return False
-        preferred_providers = self._loads(row[11], []) or []
-        if preferred_providers and (agent_provider or "").lower() not in {
-            str(provider).lower() for provider in preferred_providers
-        }:
-            return False
-        preferred_models = self._loads(row[12], []) or []
-        if preferred_models and (agent_model or "").lower() not in {str(model).lower() for model in preferred_models}:
-            return False
+        # Provider/model fields are ordering hints, not hard eligibility gates.
+        # Hard execution requirements belong in required_capabilities.
         routing_metadata = self._loads(row[32], {}) if len(row) > 32 else {}
         required_pools = self._normalized_strings(
             routing_metadata.get("required_subscription_pools") if isinstance(routing_metadata, dict) else None

@@ -3,7 +3,7 @@ from __future__ import annotations
 from mnemos.hive_mind.zeroclaw_triage import routing_patch_for_decision
 
 
-def test_zeroclaw_triage_patch_preserves_caps_and_applies_model_affinity() -> None:
+def test_zeroclaw_triage_patch_preserves_hard_caps_and_keeps_model_affinity_soft() -> None:
     patch = routing_patch_for_decision(
         {"required_capabilities": ["repo-write"], "max_cost_tier": "B"},
         {
@@ -20,7 +20,7 @@ def test_zeroclaw_triage_patch_preserves_caps_and_applies_model_affinity() -> No
     assert patch["eligible_kinds"] == ["zeroclaw"]
     assert patch["preferred_providers"] == ["groq"]
     assert patch["preferred_models"] == ["qwen3-32b"]
-    assert patch["required_capabilities"] == ["repo-write", "coding", "model:groq_qwen3_32b"]
+    assert patch["required_capabilities"] == ["repo-write", "coding"]
     assert patch["routing_metadata"]["estimated_cost_usd"] == 0.0123
 
 

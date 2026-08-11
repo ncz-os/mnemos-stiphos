@@ -20,6 +20,11 @@ def _load_worker() -> ModuleType:
     return module
 
 
+def test_worker_advertises_free_fallback_execution_tier() -> None:
+    worker = _load_worker()
+    assert "cost-tier:A" in worker.AGENT_CAPABILITIES
+
+
 def test_openai_plan_aliases_do_not_cross_grant_chatgpt_and_codex() -> None:
     worker = _load_worker()
 

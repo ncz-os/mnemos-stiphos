@@ -16,6 +16,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
+from importlib.resources import files
 from typing import Optional
 
 import aiosqlite
@@ -30,7 +31,7 @@ DB_PATH = agent_bus_db_env()
 HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
 HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
-_PUBLIC_PATHS = {"/health"}
+_PUBLIC_PATHS = {"/health", ""}  # root dashboard collects its API token in-browser
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -530,6 +531,12 @@ async def _claim_agent_context(agent_urn: str) -> dict:
     agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
     agent_caps = set(json.loads(caps_json)) if caps_json else set()
     a_tier = a_tier or "C"
+    executable_tiers = [tier for tier in COST_TIERS if f"cost-tier:{tier}" in agent_caps]
+    if executable_tiers:
+        # A fallback-capable worker may have a paid primary identity while still
+        # being able to execute free work. The terminal result is revalidated
+        # against the job cap using the provider actually used.
+        a_tier = min([a_tier, *executable_tiers], key=COST_TIERS.index)
     a_auth = (a_auth or "unknown").lower()
     # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
     # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
@@ -750,6 +757,17 @@ async def reaper_task(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    requested_backend = (
+        os.environ.get("HIVE_REPOSITORY_BACKEND")
+        or os.environ.get("MNEMOS_PERSISTENCE_BACKEND")
+        or "sqlite"
+    ).strip().lower()
+    if requested_backend not in {"sqlite", "sqlite3"} or os.environ.get("HIVE_ORACLE_DSN"):
+        raise RuntimeError(
+            "The STIPHOS REST service currently supports only SQLite; OracleHiveMindRepository "
+            "is a library API and cannot back service.py until all endpoint and lifecycle operations "
+            "are repository-backed. Refusing to silently use SQLite for the requested backend."
+        )
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
@@ -873,12 +891,10 @@ async def dashboard():
     """Minimal HTML+JS dashboard. Auto-refreshes /v1/agents + /v1/jobs + /v1/stats/* + SSE."""
     from fastapi.responses import HTMLResponse
 
-    p = "/srv/agent-bus/dashboard.html"
     try:
-        with open(p) as f:
-            return HTMLResponse(f.read())
-    except FileNotFoundError:
-        return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
+        return HTMLResponse(files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ModuleNotFoundError):
+        return HTMLResponse("<h1>dashboard.html missing</h1>", status_code=404)
 
 
 @app.post("/v1/agents/register")
@@ -1393,9 +1409,19 @@ async def update_job(job_id: str, req: JobUpdate):
             fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
             args.extend([t_in, t_out, cost_estimate])
     args.append(job_id)
-    sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?"
+    ownership_guard = ""
+    if req.claimed_by:
+        ownership_guard = " AND claimed_by=? AND status IN ('claimed','running')"
+        args.append(req.claimed_by)
+    sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?{ownership_guard}"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)
+        if cur.rowcount == 0:
+            async with db.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)) as exists_cur:
+                exists = await exists_cur.fetchone()
+            if exists:
+                raise HTTPException(409, "job ownership or state changed before update")
+            raise HTTPException(404, f"job not found: {job_id}")
         # Roll MTD spend onto claimer (subscription throttle requires this)
         if cost_estimate and cost_estimate > 0 and claimed_by_urn:
             await db.execute(
@@ -1494,8 +1520,6 @@ async def update_job(job_id: str, req: JobUpdate):
                             cost_estimate or 0,
                         )
         await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(404, f"job not found: {job_id}")
         await emit_event(
             db,
             f"job.{req.status}",

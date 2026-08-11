@@ -9,7 +9,7 @@ Part of MNEMOS. Sister to memory + GRAEAE consensus reasoning.
 | Concern | Where |
 |---|---|
 | REST service | `service.py` (FastAPI single file, ~600 LOC) |
-| MCP-SSE bridge | `mcp_bridge.py` (exposes hive + mnemos + graeae as MCP tools) |
+| MCP-SSE bridge | `mcp_bridge.py` (exposes Hive and MNEMOS tools; GRAEAE tools require `MCP_GRAEAE_ENABLED=1` and a GRAEAE-enabled upstream) |
 | Worker daemon template | `worker_template.py` (Python; ports trivial to bash/node) |
 | Schema migrations | `../../db/migrations_v6_0_hive_mind.sql` (PG) and `../../db/migrations_oracle/0010_hive_mind.sql` |
 
@@ -55,8 +55,10 @@ systemctl enable --now graeae-hive.service
 curl http://localhost:5005/health
 ```
 
-All non-health routes require `Authorization: Bearer $HIVE_BUS_TOKEN` unless
+All data routes require `Authorization: Bearer $HIVE_BUS_TOKEN` unless
 `HIVE_BUS_AUTH_REQUIRED=0` is explicitly set for isolated development/tests.
+The public dashboard shell prompts for the token and uses it for its protected
+API and SSE requests.
 
 ## Deployment folded into mnemos-api (Phase 2)
 

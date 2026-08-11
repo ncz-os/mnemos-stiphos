@@ -25,7 +25,7 @@
 
 ```bash
 pip install mnemos-stiphos            # sqlite repository, REST service
-pip install "mnemos-stiphos[oracle]"  # + Oracle 23ai backend
+pip install "mnemos-stiphos[oracle]"  # + experimental Oracle repository API
 pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 ```
 
@@ -40,28 +40,55 @@ export HIVE_BUS_TOKEN="$(openssl rand -hex 32)"
 HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
 
 # Or the published image (multi-arch amd64 + arm64)
-docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -p 127.0.0.1:8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
+docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -v stiphos-data:/data \
+  -p 127.0.0.1:8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
 ```
 
-All routes except `/health` require `Authorization: Bearer $HIVE_BUS_TOKEN` by default. Set `HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests. Workers and bridges read `HIVE_BUS_TOKEN` or `MNEMOS_HIVE_BUS_TOKEN` and attach the bearer token automatically.
+All data routes require `Authorization: Bearer $HIVE_BUS_TOKEN` by default;
+`/health` and the dashboard shell at `/` are public. Set
+`HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests. Workers
+and bridges read `HIVE_BUS_TOKEN` or `MNEMOS_HIVE_BUS_TOKEN` and attach the
+bearer token automatically.
 
-The sqlite repository self-creates its schema at runtime. For a fresh Oracle
-schema, apply `mnemos/hive_mind/oracle_ddl.sql`. The canonical production
+The dashboard shell at `/` is public so a browser can load it. It prompts for
+the bus token, keeps it only in tab-scoped `sessionStorage`, and sends it as a
+bearer header on API and SSE requests. The protected data routes remain closed.
+
+The REST service currently supports SQLite only and stores its database at
+`/data/agents.db` in the published image. The Oracle repository is an
+experimental library API; the REST service does not silently select it from an
+Oracle DSN. For a fresh schema used directly with that repository, apply
+`mnemos/hive_mind/oracle_ddl.sql`. The canonical
 convention is the shared `agents`/`jobs` ledger plus STIPHOS-owned `hive_*`
 tables, recorded as `stiphos-oracle` schema version 2 in
 `hive_schema_metadata`. The Oracle repository validates that marker and the
 required tables during `init()` and refuses to write to an unversioned,
 incomplete, or deprecated schema.
 
+If `HIVE_REPOSITORY_BACKEND` or `MNEMOS_PERSISTENCE_BACKEND` requests a
+non-SQLite service backend, startup fails explicitly instead of falling back to
+SQLite.
+
+Before replacing an older container that used the previous default path, stop
+the old container and copy the database into the mounted volume:
+
+```bash
+docker cp OLD_CONTAINER:/srv/agent-bus/agents.db ./agents.db
+docker run --rm -v stiphos-data:/data -v "$PWD:/backup:ro" busybox \
+  cp /backup/agents.db /data/agents.db
+```
+
+Keep the old container and backup until the new service reports healthy and
+the expected agents and jobs are visible.
+
 Older installations that have `memory_agents`, `memory_jobs`,
 `memory_messages`, or `memory_events` use the deprecated convention. Back up
 and test the database, then run
 `migrations/oracle/002_memory_to_canonical.sql` explicitly as the schema owner.
-The migration is idempotent, renames the legacy tables, adds the routing and
-subscription-pool fields required by the service contract, and records version
-2. It is never run automatically. If both a legacy and canonical copy of a
-table exist, the migration stops so an operator can reconcile the duplicate
-data rather than silently choosing one.
+The migration is idempotent, creates the canonical structures, copies legacy
+rows through explicit column mappings, validates the resulting schema, and
+records version 2 only after validation. It is never run automatically. The
+wheel installs it under `share/mnemos-stiphos/migrations/oracle`.
 
 ## Relationship to the rest of MNEMOS
 

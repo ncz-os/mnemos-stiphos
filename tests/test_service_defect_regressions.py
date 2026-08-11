@@ -5,6 +5,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 try:
@@ -109,3 +110,38 @@ def test_health_fails_when_reaper_is_not_running(monkeypatch, tmp_path) -> None:
 
     assert response.status_code == 503
     assert "reaper task is not running" in response.text
+
+
+def test_stale_worker_cannot_overwrite_requeued_job(monkeypatch, tmp_path) -> None:
+    db_path = _configure_service(monkeypatch, tmp_path, "ownership.sqlite3")
+    with TestClient(service.app) as client:
+        worker_urn, job_id = _register_and_create(client)
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL WHERE id=?",
+                (job_id,),
+            )
+        response = client.patch(
+            f"/v1/jobs/{job_id}",
+            json={"status": "done", "claimed_by": worker_urn, "result": {"exit_code": 0}},
+        )
+
+    assert response.status_code == 409
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("SELECT status, claimed_by FROM jobs WHERE id=?", (job_id,)).fetchone() == ("queued", None)
+
+
+def test_dashboard_loads_packaged_asset(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "dashboard.sqlite3")
+    with TestClient(service.app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert "<!doctype html>" in response.text.lower()
+
+
+def test_service_refuses_to_silently_ignore_oracle_backend_request(monkeypatch, tmp_path) -> None:
+    _configure_service(monkeypatch, tmp_path, "must-not-create.sqlite3")
+    monkeypatch.setenv("HIVE_REPOSITORY_BACKEND", "oracle")
+    with pytest.raises(RuntimeError, match="supports only SQLite"):
+        with TestClient(service.app):
+            pass

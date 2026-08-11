@@ -42,11 +42,48 @@ def test_terminal_update_retries_until_hive_acknowledges(monkeypatch: pytest.Mon
         return next(responses)
 
     monkeypatch.setattr(worker, "_http", fake_http)
+    heartbeats = []
+    monkeypatch.setattr(worker, "heartbeat", lambda: heartbeats.append(True))
     monkeypatch.setattr(worker.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(worker, "_running", True)
 
     assert worker.update_job("job-1", "done", {"exit_code": 0}, require_ack=True)
     assert len(calls) == 2
+    assert heartbeats == [True]
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 409, 422])
+def test_terminal_update_does_not_retry_permanent_conflicts(monkeypatch: pytest.MonkeyPatch, status_code: int) -> None:
+    calls = []
+    monkeypatch.setattr(worker, "_http", lambda *args: (calls.append(args) or (status_code, {"detail": "no"})))
+    monkeypatch.setattr(worker, "_running", True)
+
+    assert not worker.update_job("job-1", "done", {}, require_ack=True)
+    assert len(calls) == 1
+
+
+def test_terminal_update_stops_on_auth_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "_http", lambda *_args: (401, None))
+    monkeypatch.setattr(worker, "_running", True)
+    monkeypatch.setattr(worker, "_fatal_error", False)
+
+    assert not worker.update_job("job-1", "done", {}, require_ack=True)
+    assert worker._running is False
+    assert worker._fatal_error is True
+
+
+def test_terminal_update_bounds_server_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(worker, "_http", lambda *args: (calls.append(args) or (500, None)))
+    monkeypatch.setattr(worker, "heartbeat", lambda: None)
+    monkeypatch.setattr(worker.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(worker, "_running", True)
+    monkeypatch.setattr(worker, "_fatal_error", False)
+
+    assert not worker.update_job("job-1", "done", {}, require_ack=True)
+    assert len(calls) == 5
+    assert worker._running is False
+    assert worker._fatal_error is True
 
 
 def test_failed_push_raises_instead_of_returning_local_commits(monkeypatch: pytest.MonkeyPatch) -> None:

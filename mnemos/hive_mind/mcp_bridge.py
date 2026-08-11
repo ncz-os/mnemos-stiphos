@@ -44,9 +44,20 @@ HIVE_URL = mcp_hive_url_env()
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 MNEMOS_URL = mcp_mnemos_url_env()
 MNEMOS_TOKEN = mcp_mnemos_token_env()
+GRAEAE_ENABLED = os.environ.get("MCP_GRAEAE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
-server = Server("graeae-hive-mind")
+_MCP_DECORATOR_API = hasattr(Server, "list_tools")
+server = Server("graeae-hive-mind") if _MCP_DECORATOR_API else None
 client = httpx.AsyncClient(timeout=15.0)
+
+
+def _register(name: str):
+    """Register a v1 handler or defer it for the v2 constructor callbacks."""
+    def decorator(fn):
+        if _MCP_DECORATOR_API:
+            getattr(server, name)()(fn)
+        return fn
+    return decorator
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
@@ -72,9 +83,9 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 # ---------- tool definitions ----------
 
 
-@server.list_tools()
+@_register("list_tools")
 async def handle_list_tools() -> list[Tool]:
-    return [
+    tools = [
         Tool(
             name="hive.agent_list",
             description="List registered agents in the GRAEAE Hive Mind.",
@@ -208,6 +219,9 @@ async def handle_list_tools() -> list[Tool]:
             description="Get a MNEMOS memory by id (mem_XXX).",
             inputSchema={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
         ),
+    ]
+    if GRAEAE_ENABLED:
+        tools.extend([
         Tool(
             name="graeae.consult",
             description="Submit a multi-LLM consensus consultation to GRAEAE (PYTHIA). Modes: auto/single/all/debate/majority.",
@@ -254,12 +268,20 @@ async def handle_list_tools() -> list[Tool]:
                 "required": ["consultation_id"],
             },
         ),
-    ]
+        ])
+    return tools
 
 
-@server.call_tool()
+@_register("call_tool")
 async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     try:
+        if name.startswith("graeae.") and not GRAEAE_ENABLED:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "GRAEAE tools are disabled; set MCP_GRAEAE_ENABLED=1 only when the upstream MNEMOS service includes mnemos-graeae"}),
+                )
+            ]
         if name == "hive.agent_list":
             r = await _hive("GET", "/v1/agents", params={k: v for k, v in args.items() if v})
         elif name == "hive.agent_register":
@@ -306,14 +328,38 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
 
 
 # Silence -32601 method-not-found warnings on opencode boot.
-@server.list_resources()
+@_register("list_resources")
 async def _list_resources() -> list[Resource]:
     return []
 
 
-@server.list_prompts()
+@_register("list_prompts")
 async def _list_prompts() -> list[Prompt]:
     return []
+
+
+if not _MCP_DECORATOR_API:
+    from mcp.types import CallToolResult, ListPromptsResult, ListResourcesResult, ListToolsResult
+
+    async def _v2_list_tools(_context, _params):
+        return ListToolsResult(tools=await handle_list_tools())
+
+    async def _v2_call_tool(_context, params):
+        return CallToolResult(content=await handle_call_tool(params.name, dict(params.arguments or {})))
+
+    async def _v2_list_resources(_context, _params):
+        return ListResourcesResult(resources=await _list_resources())
+
+    async def _v2_list_prompts(_context, _params):
+        return ListPromptsResult(prompts=await _list_prompts())
+
+    server = Server(
+        "graeae-hive-mind",
+        on_list_tools=_v2_list_tools,
+        on_call_tool=_v2_call_tool,
+        on_list_resources=_v2_list_resources,
+        on_list_prompts=_v2_list_prompts,
+    )
 
 
 # ---------- SSE transport ----------

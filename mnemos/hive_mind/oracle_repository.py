@@ -184,7 +184,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                 raise OracleSchemaCompatibilityError(
                     "Unsupported deprecated Oracle MEMORY_* schema detected "
                     f"({', '.join(legacy)}). STIPHOS expects canonical AGENTS/JOBS and HIVE_* tables "
-                    f"at schema version {ORACLE_SCHEMA_VERSION}; apply {migration} before starting the service."
+                    f"at schema version {ORACLE_SCHEMA_VERSION}; apply {migration} before initializing the repository."
                 )
             if missing:
                 raise OracleSchemaCompatibilityError(
@@ -202,7 +202,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             if actual != ORACLE_SCHEMA_VERSION:
                 raise OracleSchemaCompatibilityError(
                     f"Unsupported STIPHOS Oracle schema version {actual!r}; expected "
-                    f"{ORACLE_SCHEMA_VERSION}. Apply the required forward migration before starting the service."
+                    f"{ORACLE_SCHEMA_VERSION}. Apply the required forward migration before initializing the repository."
                 )
 
     async def close(self) -> None:
@@ -898,12 +898,8 @@ class OracleHiveMindRepository(HiveMindRepository):
         eligible = _json_loads(row[8], None)
         if eligible and agent_kind not in set(eligible):
             return False
-        providers = {str(v).lower() for v in (_json_loads(row[11], []) or [])}
-        if providers and agent_provider.lower() not in providers:
-            return False
-        models = {str(v).lower() for v in (_json_loads(row[12], []) or [])}
-        if models and agent_model.lower() not in models:
-            return False
+        # preferred_providers/preferred_models are soft routing hints. Only
+        # required_capabilities and the explicit gates below are mandatory.
         routing = _json_loads(row[32], {}) or {}
         required_pools = self._normalized_strings(routing.get("required_subscription_pools"))
         if required_pools:

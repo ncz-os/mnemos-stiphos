@@ -459,8 +459,18 @@ def test_oracle_ddl_and_forward_migration_declare_canonical_schema() -> None:
     for table in ("agents", "jobs", "hive_messages", "hive_events", "hive_cache", "hive_worker_kind_stats"):
         assert f"CREATE TABLE {table}" in ddl
     assert "VALUES ('stiphos-oracle', 2)" in ddl
-    assert "rename_table_if_needed('MEMORY_JOBS', 'JOBS')" in migration
+    assert "SELECT agent_urn urn" in migration
+    assert "ELSIF column_exists('MEMORY_AGENTS','URN')" in migration
+    assert "CAST(NVL(created_at,SYSTIMESTAMP) AS TIMESTAMP WITH TIME ZONE)" in migration
+    assert "ELSIF column_exists('MEMORY_JOBS','REQUIRED_CAPABILITIES')" in migration
+    assert "MERGE INTO hive_messages" in migration
+    assert "MERGE INTO hive_events" in migration
+    assert "MERGE INTO hive_scheduled_jobs" in migration
+    assert "require_columns('AGENTS'" in migration
+    assert "require_columns('JOBS'" in migration
+    assert "archive('MEMORY_JOBS','LEGACY_MEMORY_JOBS')" in migration
     assert "MERGE INTO hive_schema_metadata" in migration
+    assert migration.index("require_columns('JOBS'") < migration.index("MERGE INTO hive_schema_metadata")
 
 
 @pytest.mark.asyncio
