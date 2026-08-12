@@ -23,6 +23,8 @@ Tools:
 """
 
 from __future__ import annotations
+
+import secrets
 import json
 import os
 from typing import Any
@@ -34,6 +36,9 @@ from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
@@ -401,14 +406,54 @@ async def handle_sse(request):
         )
 
 
+# Inbound ingress credential, independent of the two UPSTREAM tokens this
+# process holds (HIVE_BUS_TOKEN and MNEMOS_TOKEN). Without it the bridge is an
+# open relay: anything that can reach the port gets both upstreams' authority.
+MCP_BRIDGE_TOKEN = os.environ.get("MCP_BRIDGE_TOKEN", "").strip()
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def mcp_bridge_host_env() -> str:
+    """Bind address. Defaults to loopback: this process relays two privileged
+    upstream credentials, so it must not be reachable off-box by accident."""
+    return os.environ.get("MCP_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+class _RequireBridgeToken(BaseHTTPMiddleware):
+    """Authenticate INBOUND callers.
+
+    Enforced whenever MCP_BRIDGE_TOKEN is set. Binding off-loopback without one
+    is refused outright at startup (see __main__), so an exposed bridge is
+    always authenticated and a loopback-only dev run stays frictionless.
+    """
+
+    async def dispatch(self, request, call_next):
+        if MCP_BRIDGE_TOKEN:
+            header = request.headers.get("authorization", "")
+            presented = header[7:] if header.lower().startswith("bearer ") else ""
+            if not secrets.compare_digest(presented, MCP_BRIDGE_TOKEN):
+                return PlainTextResponse("unauthorized", status_code=401)
+        return await call_next(request)
+
+
 app = Starlette(
     debug=False,
     routes=[
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),
     ],
+    middleware=[Middleware(_RequireBridgeToken)],
 )
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=mcp_port_env())
+    _host = mcp_bridge_host_env()
+    if _host not in _LOOPBACK_HOSTS and not MCP_BRIDGE_TOKEN:
+        raise SystemExit(
+            f"refusing to bind {_host} without MCP_BRIDGE_TOKEN: this bridge relays "
+            "HIVE_BUS_TOKEN and MNEMOS_TOKEN upstream, so an unauthenticated "
+            "off-loopback listener hands both to anyone who can reach the port. "
+            "Set MCP_BRIDGE_TOKEN, or leave MCP_BRIDGE_HOST at 127.0.0.1."
+        )
+    uvicorn.run(app, host=_host, port=mcp_port_env())
