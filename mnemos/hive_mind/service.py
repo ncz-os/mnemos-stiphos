@@ -1455,8 +1455,15 @@ async def update_job(job_id: str, req: JobUpdate):
     }
     if req.status != current_status and req.status not in allowed_transitions.get(current_status, set()):
         raise HTTPException(409, f"invalid job transition: {current_status} -> {req.status}")
-    if req.claimed_by and current_claimer and req.claimed_by != current_claimer:
-        raise HTTPException(409, "job is owned by a different worker")
+    # Fail CLOSED. The guard used to require req.claimed_by to be supplied, so a
+    # caller could transition someone else's job simply by omitting the field --
+    # the check it was meant to enforce was opt-in for the party it constrains.
+    # If the job is claimed, the caller must prove which worker it is.
+    if current_claimer:
+        if not req.claimed_by:
+            raise HTTPException(409, "job is claimed; claimed_by is required to update it")
+        if req.claimed_by != current_claimer:
+            raise HTTPException(409, "job is owned by a different worker")
 
     reported_provider = None
     reported_model = None
@@ -1557,10 +1564,16 @@ async def update_job(job_id: str, req: JobUpdate):
             fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
             args.extend([t_in, t_out, cost_estimate])
     args.extend([job_id, current_status])
+    # Always constrain the UPDATE by owner when the job is claimed, so a
+    # concurrent re-claim between the SELECT above and this UPDATE cannot let
+    # the losing worker write the winner's row.
     ownership_guard = ""
     if req.claimed_by:
         ownership_guard = " AND claimed_by=?"
         args.append(req.claimed_by)
+    elif current_claimer:
+        ownership_guard = " AND claimed_by=?"
+        args.append(current_claimer)
     sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status=?{ownership_guard}"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)

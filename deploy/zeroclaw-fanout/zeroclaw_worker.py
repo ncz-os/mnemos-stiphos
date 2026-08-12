@@ -44,7 +44,13 @@ import re as _re
 from pathlib import Path
 from typing import Optional
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# Single source of truth with the triage side. These previously carried
+# DIFFERENT hardcoded defaults (.8 here in core config vs .67 here), so with
+# HIVE_URL unset the triage process and its workers talked to different hosts
+# and silently never saw each other's jobs.
+from mnemos.core.config import system_hive_url_env  # noqa: E402
+
+HIVE_URL = os.environ.get("HIVE_URL") or system_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002").rstrip("/")
