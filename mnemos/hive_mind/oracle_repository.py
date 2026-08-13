@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import random
 import time
 import uuid
@@ -141,7 +142,14 @@ class OracleHiveMindRepository(HiveMindRepository):
         max_pool: int = 4,
         increment: int = 1,
         pool: Any = None,
+        max_result_page_size: int | None = None,
     ) -> None:
+        if max_result_page_size is None:
+            try:
+                max_result_page_size = int(os.environ.get("HIVE_MAX_RESULT_PAGE_SIZE", "1000"))
+            except ValueError:
+                max_result_page_size = 1000
+        self.max_result_page_size = max(1, max_result_page_size)
         if pool is not None:
             self._pool = pool
             return
@@ -439,7 +447,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         sql = (
             "SELECT urn, kind, host, started_at, last_heartbeat, capabilities FROM agents WHERE 1=1"
         )
-        params: dict[str, Any] = {"limit": int(limit)}
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), self.max_result_page_size))}
         if status:
             sql += " AND status = :status"
             params["status"] = status
@@ -805,6 +813,14 @@ class OracleHiveMindRepository(HiveMindRepository):
                     "ORDER BY priority DESC, started_at ASC FOR UPDATE SKIP LOCKED",
                     params,
                 )
+                pools_cur = self._execute(
+                    conn,
+                    "SELECT subscription_pools FROM agents "
+                    "WHERE urn=:urn AND status IN ('online','idle')",
+                    {"urn": agent_urn},
+                )
+                pools_row = pools_cur.fetchone()
+                agent_pools = self._normalized_strings(pools_row[0] if pools_row else None)
                 for row in cur:
                     if not self._service_job_is_claimable(
                         conn,
@@ -817,6 +833,7 @@ class OracleHiveMindRepository(HiveMindRepository):
                         agent_tier=agent_tier,
                         cost_tier_order=cost_tier_order,
                         sub_throttled=sub_throttled,
+                        agent_pools=agent_pools,
                     ):
                         if job_id is not None:
                             conn.rollback()
@@ -892,6 +909,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         agent_tier: str,
         cost_tier_order: list[str],
         sub_throttled: bool,
+        agent_pools: set[str] | None = None,
     ) -> bool:
         if not set(_json_loads(row[7], []) or []).issubset(agent_caps):
             return False
@@ -903,13 +921,16 @@ class OracleHiveMindRepository(HiveMindRepository):
         routing = _json_loads(row[32], {}) or {}
         required_pools = self._normalized_strings(routing.get("required_subscription_pools"))
         if required_pools:
-            cur = self._execute(
-                conn,
-                "SELECT subscription_pools FROM agents WHERE urn=:urn AND status IN ('online','idle')",
-                {"urn": agent_urn},
-            )
-            agent_row = cur.fetchone()
-            if not required_pools.intersection(self._normalized_strings(agent_row[0] if agent_row else None)):
+            resolved_agent_pools = agent_pools
+            if resolved_agent_pools is None:
+                cur = self._execute(
+                    conn,
+                    "SELECT subscription_pools FROM agents WHERE urn=:urn AND status IN ('online','idle')",
+                    {"urn": agent_urn},
+                )
+                agent_row = cur.fetchone()
+                resolved_agent_pools = self._normalized_strings(agent_row[0] if agent_row else None)
+            if not required_pools.intersection(resolved_agent_pools):
                 return False
         if sub_throttled and str(row[10] or "A").upper() != "A":
             return False
@@ -918,10 +939,17 @@ class OracleHiveMindRepository(HiveMindRepository):
                 return False
         except ValueError:
             return False
-        for dependency in _json_loads(row[14], []) or []:
-            cur = self._execute(conn, "SELECT status FROM jobs WHERE id=:id", {"id": _uuid_to_raw(dependency)})
-            dep = cur.fetchone()
-            if not dep or dep[0] != "done":
+        dependencies = _json_loads(row[14], []) or []
+        if dependencies:
+            params = {f"dep_{index}": _uuid_to_raw(dependency) for index, dependency in enumerate(dependencies)}
+            placeholders = ", ".join(f":{name}" for name in params)
+            cur = self._execute(
+                conn,
+                f"SELECT id, status FROM jobs WHERE id IN ({placeholders})",
+                params,
+            )
+            statuses = {dep_id: status for dep_id, status in cur.fetchall()}
+            if any(statuses.get(raw_id) != "done" for raw_id in params.values()):
                 return False
         return True
 
@@ -1099,7 +1127,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         sql = (
             "SELECT " + _ORACLE_JOB_SELECT_COLUMNS + " FROM jobs WHERE 1=1"
         )
-        params: dict[str, Any] = {"limit": int(limit)}
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), self.max_result_page_size))}
         for name, value in {
             "status": status,
             "kind": kind,

@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from mnemos.core.config import mcp_mnemos_token_env, mcp_mnemos_url_env, system_hive_url_env
+from mnemos.hive_mind.config import mcp_mnemos_token_env, mcp_mnemos_url_env, system_hive_url_env
 
 HIVE_URL = os.environ.get("HIVE_URL") or system_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). _http_json is generic, so we
@@ -26,6 +26,10 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE
 MNEMOS_URL = os.environ.get("MNEMOS_URL") or mcp_mnemos_url_env()
 MNEMOS_TOKEN = os.environ.get("MNEMOS_API_KEY") or os.environ.get("MNEMOS_TOKEN") or mcp_mnemos_token_env()
 POLL_INTERVAL = float(os.environ.get("ZEROCLAW_TRIAGE_POLL_INTERVAL", "10"))
+IDLE_MAX_POLL_INTERVAL = max(
+    POLL_INTERVAL,
+    float(os.environ.get("ZEROCLAW_TRIAGE_IDLE_MAX_POLL_INTERVAL", str(POLL_INTERVAL))),
+)
 BATCH_LIMIT = int(os.environ.get("ZEROCLAW_TRIAGE_BATCH_LIMIT", "25"))
 DEFAULT_EST_TOKENS_IN = int(os.environ.get("ZEROCLAW_TRIAGE_EST_TOKENS_IN", "10000"))
 DEFAULT_EST_TOKENS_OUT = int(os.environ.get("ZEROCLAW_TRIAGE_EST_TOKENS_OUT", "2000"))
@@ -194,9 +198,12 @@ def run_once() -> int:
 
 def main() -> None:
     print(f"[zc-triage] starting HIVE_URL={HIVE_URL} MNEMOS_URL={MNEMOS_URL}", flush=True)
+    idle_polls = 0
     while _running:
-        run_once()
-        time.sleep(POLL_INTERVAL)
+        routed = run_once()
+        idle_polls = 0 if routed else idle_polls + 1
+        interval = min(IDLE_MAX_POLL_INTERVAL, POLL_INTERVAL * (2 ** min(idle_polls, 16)))
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

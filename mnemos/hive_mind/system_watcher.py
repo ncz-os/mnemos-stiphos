@@ -15,6 +15,7 @@ Env:
   AGENT_HOST                default hostname -s
   LOAD_THRESHOLD            max 1-min load_avg before refusing new jobs (default 0.75 × cpu_count)
   HEARTBEAT_INTERVAL        seconds (default 15)
+  SYSTEM_LOAD_INTERVAL      seconds between system.load messages (default HEARTBEAT_INTERVAL)
   CLAIM_JOBS                if "1", actively claim eligible jobs and dispatch to local executor (default "0" = passive monitor only)
 """
 
@@ -32,13 +33,17 @@ import urllib.request
 import urllib.error
 import signal
 
-from mnemos.core.config import agent_host_env, claim_jobs_enabled_env, heartbeat_interval_env, system_hive_url_env
+from mnemos.hive_mind.config import agent_host_env, claim_jobs_enabled_env, heartbeat_interval_env, system_hive_url_env
 
 HIVE_URL = system_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
 AGENT_HOST = agent_host_env()
 HEARTBEAT_INTERVAL = heartbeat_interval_env()
+SYSTEM_LOAD_INTERVAL = max(
+    HEARTBEAT_INTERVAL,
+    float(os.environ.get("SYSTEM_LOAD_INTERVAL", str(HEARTBEAT_INTERVAL))),
+)
 CLAIM_JOBS = claim_jobs_enabled_env()
 
 _urn: str = ""
@@ -269,11 +274,13 @@ def register():
         sys.exit(1)
 
 
-def heartbeat():
-    load = dynamic_load()
+def heartbeat(*, publish_load: bool = True):
     # Update via heartbeat endpoint; payload-side metadata refresh would need new endpoint — for now load goes in metadata only at re-register; emit load as a hive message every heartbeat for live visibility
     _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
+    if not publish_load:
+        return
     # broadcast load as a system.load message
+    load = dynamic_load()
     _http(
         "POST",
         "/v1/messages",
@@ -289,8 +296,13 @@ def heartbeat():
 def main():
     print(f"[sysw] starting on {AGENT_HOST} HIVE_URL={HIVE_URL} CLAIM_JOBS={CLAIM_JOBS}", flush=True)
     register()
+    last_load_publish = float("-inf")
     while _running:
-        heartbeat()
+        now = time.monotonic()
+        publish_load = now - last_load_publish >= SYSTEM_LOAD_INTERVAL
+        heartbeat(publish_load=publish_load)
+        if publish_load:
+            last_load_publish = now
         time.sleep(HEARTBEAT_INTERVAL)
     print("[sysw] clean shutdown", flush=True)
 

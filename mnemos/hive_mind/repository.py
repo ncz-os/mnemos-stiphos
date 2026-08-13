@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import sqlite3
 import time
@@ -105,10 +106,33 @@ _SERVICE_JOB_SELECT_COLUMNS = (
     "estimated_cost_usd, retry_count, max_retries, routing_metadata"
 )
 
+_SERVICE_JOB_CANDIDATE_COLUMNS = (
+    "id, required_capabilities, eligible_kinds, max_cost_tier, depends_on, "
+    "routing_metadata, priority, started_at"
+)
+
 
 class SqliteHiveMindRepository:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        claim_candidate_page_size: int | None = None,
+        max_result_page_size: int | None = None,
+    ) -> None:
         self.db_path = db_path
+        if claim_candidate_page_size is None:
+            try:
+                claim_candidate_page_size = int(os.environ.get("HIVE_CLAIM_CANDIDATE_PAGE_SIZE", "256"))
+            except ValueError:
+                claim_candidate_page_size = 256
+        self.claim_candidate_page_size = max(1, claim_candidate_page_size)
+        if max_result_page_size is None:
+            try:
+                max_result_page_size = int(os.environ.get("HIVE_MAX_RESULT_PAGE_SIZE", "1000"))
+            except ValueError:
+                max_result_page_size = 1000
+        self.max_result_page_size = max(1, max_result_page_size)
 
     @staticmethod
     def _json(value: Any) -> str | None:
@@ -248,6 +272,8 @@ class SqliteHiveMindRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_queue
                   ON jobs(status, priority DESC, started_at ASC);
+                CREATE INDEX IF NOT EXISTS idx_jobs_costs
+                  ON jobs(ended_at, claimed_provider, claimed_model);
                 CREATE TABLE IF NOT EXISTS worker_kind_stats (
                   urn TEXT NOT NULL,
                   kind TEXT NOT NULL,
@@ -680,69 +706,136 @@ class SqliteHiveMindRepository:
             if not self._table_exists(db, "jobs"):
                 return self._claim_next_job_sync(agent_urn=agent_urn, agent_kind=agent_kind)
             db.execute("PRAGMA busy_timeout=30000")
-            db.execute("BEGIN IMMEDIATE")
             try:
-                rows = db.execute(
-                    f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} "
-                    "FROM jobs "
-                    "WHERE status='queued' "
-                    "AND claimed_by IS NULL "
-                    "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                    "ORDER BY priority DESC, started_at ASC",
-                    (now,),
-                ).fetchall()
-                for row in rows:
-                    if not self._service_job_is_claimable(
-                        db,
-                        row=row,
-                        agent_urn=agent_urn,
-                        agent_kind=agent_kind,
-                        agent_caps=agent_caps,
-                        agent_model=agent_model,
-                        agent_provider=agent_provider,
-                        agent_tier=agent_tier,
-                        cost_tier_order=cost_tier_order,
-                        sub_throttled=sub_throttled,
-                    ):
-                        continue
-                    cur = db.execute(
-                        "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
-                        "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
-                        "claimed_cost_tier=? "
-                        "WHERE id=? AND status='queued' AND claimed_by IS NULL",
-                        (
-                            agent_urn,
-                            now,
-                            agent_runtime,
-                            agent_model,
-                            agent_provider,
-                            agent_tier,
-                            row[0],
-                        ),
+                agent_pools_row = db.execute(
+                    "SELECT subscription_pools FROM agents WHERE urn=? AND status IN ('online','idle')",
+                    (agent_urn,),
+                ).fetchone()
+                agent_pools = self._normalized_strings(agent_pools_row[0] if agent_pools_row else None)
+                cursor: tuple[int, float, str] | None = None
+
+                while True:
+                    where = (
+                        "status='queued' AND claimed_by IS NULL "
+                        "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?)"
                     )
-                    if cur.rowcount != 1:
-                        continue
-                    db.commit()
-                    claimed_row = list(row)
-                    claimed_row[15] = "claimed"
-                    claimed_row[16] = agent_urn
-                    claimed_row[17] = now
-                    claimed_row[18] = agent_runtime
-                    claimed_row[19] = agent_model
-                    claimed_row[20] = agent_provider
-                    claimed_row[21] = agent_tier
-                    claimed = self._service_job_from_row(claimed_row)
-                    claimed["claimed_resources"] = {
-                        "runtime": agent_runtime,
-                        "model": agent_model,
-                        "provider": agent_provider,
-                        "cost_tier": agent_tier,
+                    params: list[Any] = [now]
+                    if cursor is not None:
+                        priority, started_at, job_id = cursor
+                        where += (
+                            " AND (priority < ? OR (priority = ? AND "
+                            "(started_at > ? OR (started_at = ? AND id > ?))))"
+                        )
+                        params.extend((priority, priority, started_at, started_at, job_id))
+                    params.append(self.claim_candidate_page_size)
+                    candidates = db.execute(
+                        f"SELECT {_SERVICE_JOB_CANDIDATE_COLUMNS} FROM jobs WHERE {where} "
+                        "ORDER BY priority DESC, started_at ASC, id ASC LIMIT ?",
+                        params,
+                    ).fetchall()
+                    if not candidates:
+                        return None
+
+                    dependency_ids = {
+                        dependency
+                        for candidate in candidates
+                        for dependency in (self._loads(candidate[4], []) or [])
                     }
-                    return claimed
-                db.rollback()
-                return None
+                    dependency_statuses: dict[str, str] = {}
+                    if dependency_ids:
+                        dependency_list = list(dependency_ids)
+                        for offset in range(0, len(dependency_list), 500):
+                            dependency_batch = dependency_list[offset : offset + 500]
+                            placeholders = ",".join("?" for _ in dependency_batch)
+                            dependency_statuses.update(
+                                db.execute(
+                                    f"SELECT id, status FROM jobs WHERE id IN ({placeholders})",
+                                    tuple(dependency_batch),
+                                ).fetchall()
+                            )
+
+                    for candidate in candidates:
+                        eligibility_row: list[Any] = [None] * 33
+                        for source_index, target_index in enumerate((0, 7, 8, 10, 14, 32)):
+                            eligibility_row[target_index] = candidate[source_index]
+                        if not self._service_job_is_claimable(
+                            db,
+                            row=eligibility_row,
+                            agent_urn=agent_urn,
+                            agent_kind=agent_kind,
+                            agent_caps=agent_caps,
+                            agent_model=agent_model,
+                            agent_provider=agent_provider,
+                            agent_tier=agent_tier,
+                            cost_tier_order=cost_tier_order,
+                            sub_throttled=sub_throttled,
+                            agent_pools=agent_pools,
+                            dependency_statuses=dependency_statuses,
+                        ):
+                            continue
+
+                        db.execute("BEGIN IMMEDIATE")
+                        current_candidate = db.execute(
+                            f"SELECT {_SERVICE_JOB_CANDIDATE_COLUMNS} FROM jobs "
+                            "WHERE id=? AND status='queued' AND claimed_by IS NULL "
+                            "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?)",
+                            (candidate[0], now),
+                        ).fetchone()
+                        current_eligibility_row: list[Any] = [None] * 33
+                        if current_candidate:
+                            for source_index, target_index in enumerate((0, 7, 8, 10, 14, 32)):
+                                current_eligibility_row[target_index] = current_candidate[source_index]
+                        if not current_candidate or not self._service_job_is_claimable(
+                            db,
+                            row=current_eligibility_row,
+                            agent_urn=agent_urn,
+                            agent_kind=agent_kind,
+                            agent_caps=agent_caps,
+                            agent_model=agent_model,
+                            agent_provider=agent_provider,
+                            agent_tier=agent_tier,
+                            cost_tier_order=cost_tier_order,
+                            sub_throttled=sub_throttled,
+                        ):
+                            db.rollback()
+                            continue
+                        cur = db.execute(
+                            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
+                            "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
+                            "claimed_cost_tier=? "
+                            "WHERE id=? AND status='queued' AND claimed_by IS NULL",
+                            (
+                                agent_urn,
+                                now,
+                                agent_runtime,
+                                agent_model,
+                                agent_provider,
+                                agent_tier,
+                                candidate[0],
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            db.rollback()
+                            continue
+                        claimed_row = db.execute(
+                            f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} FROM jobs WHERE id=?",
+                            (candidate[0],),
+                        ).fetchone()
+                        db.commit()
+                        claimed = self._service_job_from_row(claimed_row)
+                        claimed["claimed_resources"] = {
+                            "runtime": agent_runtime,
+                            "model": agent_model,
+                            "provider": agent_provider,
+                            "cost_tier": agent_tier,
+                        }
+                        return claimed
+
+                    last = candidates[-1]
+                    cursor = (int(last[6]), float(last[7]), str(last[0]))
             except Exception:
-                db.rollback()
+                if db.in_transaction:
+                    db.rollback()
                 raise
 
     async def claim_job_by_id(
@@ -909,6 +1002,8 @@ class SqliteHiveMindRepository:
         agent_tier: str,
         cost_tier_order: list[str],
         sub_throttled: bool,
+        agent_pools: set[str] | None = None,
+        dependency_statuses: dict[str, str] | None = None,
     ) -> bool:
         required_caps = set(self._loads(row[7], []) or [])
         if required_caps and not required_caps.issubset(agent_caps):
@@ -923,12 +1018,14 @@ class SqliteHiveMindRepository:
             routing_metadata.get("required_subscription_pools") if isinstance(routing_metadata, dict) else None
         )
         if required_pools:
-            agent_pools_row = db.execute(
-                "SELECT subscription_pools FROM agents WHERE urn=? AND status IN ('online','idle')",
-                (agent_urn,),
-            ).fetchone()
-            agent_pools = self._normalized_strings(agent_pools_row[0] if agent_pools_row else None)
-            if not agent_pools.intersection(required_pools):
+            resolved_agent_pools = agent_pools
+            if resolved_agent_pools is None:
+                agent_pools_row = db.execute(
+                    "SELECT subscription_pools FROM agents WHERE urn=? AND status IN ('online','idle')",
+                    (agent_urn,),
+                ).fetchone()
+                resolved_agent_pools = self._normalized_strings(agent_pools_row[0] if agent_pools_row else None)
+            if not resolved_agent_pools.intersection(required_pools):
                 return False
         if sub_throttled and (row[10] or "A").upper() != "A":
             return False
@@ -941,13 +1038,17 @@ class SqliteHiveMindRepository:
             return False
         depends_on = self._loads(row[14], []) or []
         if depends_on:
-            placeholders = ",".join("?" * len(depends_on))
-            done_count = db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND status='done'",
-                tuple(depends_on),
-            ).fetchone()[0]
-            if int(done_count) != len(depends_on):
-                return False
+            if dependency_statuses is not None:
+                if any(dependency_statuses.get(dependency) != "done" for dependency in depends_on):
+                    return False
+            else:
+                placeholders = ",".join("?" for _ in depends_on)
+                done_count = db.execute(
+                    f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+                    tuple(depends_on),
+                ).fetchone()[0]
+                if int(done_count) != len(depends_on):
+                    return False
         return True
 
     def _claim_next_job_sync(self, *, agent_urn: str, agent_kind: str) -> Optional[dict[str, Any]]:
@@ -1051,7 +1152,7 @@ class SqliteHiveMindRepository:
                 sql += f" AND {name}=?"
                 params.append(value)
         sql += " ORDER BY priority DESC, created_at DESC LIMIT ?"
-        params.append(int(limit))
+        params.append(max(1, min(int(limit), self.max_result_page_size)))
         with sqlite3.connect(self.db_path, timeout=30.0) as db:
             rows = db.execute(sql, params).fetchall()
         return [self._job_from_row(row) for row in rows]

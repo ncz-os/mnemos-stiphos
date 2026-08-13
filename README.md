@@ -29,7 +29,7 @@ pip install "mnemos-stiphos[oracle]"  # + experimental Oracle repository API
 pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 ```
 
-`mnemos-stiphos` contributes the `mnemos.hive_mind` subpackage to the shared PEP 420 `mnemos.*` namespace and depends on `mnemos-core` for config and persistence helpers. (The distribution is named STIPHOS; the module path stays `mnemos.hive_mind`.)
+`mnemos-stiphos` contributes the `mnemos.hive_mind` subpackage to the shared PEP 420 `mnemos.*` namespace. It is self-contained and can coexist with other `mnemos.*` namespace packages. (The distribution is named STIPHOS; the module path stays `mnemos.hive_mind`.)
 
 ## Run
 
@@ -53,6 +53,20 @@ bearer token automatically.
 The dashboard shell at `/` is public so a browser can load it. It prompts for
 the bus token, keeps it only in tab-scoped `sessionStorage`, and sends it as a
 bearer header on API and SSE requests. The protected data routes remain closed.
+
+Performance bounds are configurable. Their defaults preserve prior runtime
+behavior except for newly bounded result and claim pages:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `HIVE_CLAIM_CANDIDATE_PAGE_SIZE` | `256` | Lightweight rows inspected per SQLite claim page |
+| `HIVE_MAX_RESULT_PAGE_SIZE` | `1000` | Maximum jobs, messages, or event-log rows per JSON response |
+| `HIVE_SSE_CATCHUP_PAGE_SIZE` | `500` | Persisted events read per SSE catch-up batch |
+| `HIVE_SSE_EVENT_QUEUE_SIZE` | `1000` | Buffered live events per subscriber |
+| `HIVE_DASHBOARD_ANALYTICS_REFRESH_SECONDS` | `5` | Cost/cache refresh interval; set `30`–`60` to reduce scans |
+| `HIVE_SYSTEM_LOAD_RETAIN_HOURS` | `0` | Optional `system.load` retention; `0` keeps messages indefinitely |
+| `SYSTEM_LOAD_INTERVAL` | heartbeat interval | Watcher load-message interval; heartbeat cadence is unchanged |
+| `ZEROCLAW_TRIAGE_IDLE_MAX_POLL_INTERVAL` | poll interval | Optional maximum idle polling backoff |
 
 The REST service currently supports SQLite only and stores its database at
 `/data/agents.db` in the published image. The Oracle repository is an
@@ -92,7 +106,7 @@ wheel installs it under `share/mnemos-stiphos/migrations/oracle`.
 
 ## Relationship to the rest of MNEMOS
 
-- **mnemos-core** — memory substrate, config, persistence. Hard dependency.
+- **mnemos-core** — memory substrate used by the wider MNEMOS deployment; not required by STIPHOS.
 - **mnemos-knemon** — the hybrid model router / hive *ledger* views. Reads the shared `agents`/`subscription_pools` schema (with graceful fallback when absent).
 - **graeae-hive / graeae-hive-mind** — the separate build-fabric / worker-daemon track.
 

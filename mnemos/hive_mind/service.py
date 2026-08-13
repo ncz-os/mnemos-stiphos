@@ -26,13 +26,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from mnemos.core.config import agent_bus_db_env
+from mnemos.hive_mind.config import agent_bus_db_env
 
 DB_PATH = agent_bus_db_env()
 HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
 HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 _PUBLIC_PATHS = {"/health", "", "/dashboard.js"}  # dashboard assets collect the API token in-browser
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -43,7 +50,15 @@ _REPO = SqliteHiveMindRepository(DB_PATH)
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_DEAD_AFTER = 60.0
 EVENTS_RETAIN_HOURS = 168  # 7 days
+SYSTEM_LOAD_RETAIN_HOURS = max(0.0, float(os.environ.get("HIVE_SYSTEM_LOAD_RETAIN_HOURS", "0")))
 SSE_PING_INTERVAL = 15.0
+MAX_RESULT_PAGE_SIZE = _positive_env_int("HIVE_MAX_RESULT_PAGE_SIZE", 1000)
+SSE_CATCHUP_PAGE_SIZE = _positive_env_int("HIVE_SSE_CATCHUP_PAGE_SIZE", 500)
+SSE_EVENT_QUEUE_SIZE = _positive_env_int("HIVE_SSE_EVENT_QUEUE_SIZE", 1000)
+DASHBOARD_LIVE_REFRESH_SECONDS = _positive_env_int("HIVE_DASHBOARD_LIVE_REFRESH_SECONDS", 5)
+DASHBOARD_ANALYTICS_REFRESH_SECONDS = _positive_env_int(
+    "HIVE_DASHBOARD_ANALYTICS_REFRESH_SECONDS", DASHBOARD_LIVE_REFRESH_SECONDS
+)
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 
 
@@ -56,6 +71,10 @@ def _env_bool(names: tuple[str, ...], *, default: bool) -> bool:
         if raw is not None:
             return raw.strip().lower() not in _FALSE_ENV_VALUES
     return default
+
+
+def _bounded_result_limit(limit: int) -> int:
+    return max(1, min(int(limit), MAX_RESULT_PAGE_SIZE))
 
 
 def _configured_bus_tokens() -> tuple[str, ...]:
@@ -185,6 +204,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);  -- #10 FIX
 CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until);
+CREATE INDEX IF NOT EXISTS idx_jobs_costs ON jobs(ended_at, claimed_provider, claimed_model);
 
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
   id TEXT PRIMARY KEY,
@@ -803,6 +823,12 @@ async def reaper_task(app: FastAPI):
                 # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
+                if SYSTEM_LOAD_RETAIN_HOURS > 0:
+                    load_retain_cutoff = time.time() - SYSTEM_LOAD_RETAIN_HOURS * 3600
+                    await db.execute(
+                        "DELETE FROM messages WHERE topic='system.load' AND ts < ?",
+                        (load_retain_cutoff,),
+                    )
                 await db.commit()
             app.state.reaper_last_success = time.time()
             app.state.reaper_last_error = None
@@ -869,6 +895,9 @@ async def lifespan(app: FastAPI):
                     print(f"migration warn ({stmt!r}): {e}", flush=True)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_costs ON jobs(ended_at, claimed_provider, claimed_model)"
+        )
         await db.commit()
     app.state.reaper_last_success = time.time()
     app.state.reaper_last_error = None
@@ -970,6 +999,8 @@ async def dashboard_script():
     source = files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8")
     marker = '<script id="dashboard-code" type="text/plain">'
     script = source.split(marker, 1)[1].split("</script>", 1)[0]
+    script = script.replace("__LIVE_REFRESH_MS__", str(DASHBOARD_LIVE_REFRESH_SECONDS * 1000))
+    script = script.replace("__ANALYTICS_REFRESH_MS__", str(DASHBOARD_ANALYTICS_REFRESH_SECONDS * 1000))
     return Response(script, media_type="application/javascript", headers={"Cache-Control": "no-store"})
 
 
@@ -1877,7 +1908,7 @@ async def worker_stats(kind: Optional[str] = None, top_n: int = 30, include_syst
     if not include_system:
         sql += " AND urn NOT LIKE 'urn:agent:system:%'"
     sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
-    args.append(int(top_n))
+    args.append(_bounded_result_limit(top_n))
     rows = []
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:
@@ -1907,16 +1938,14 @@ async def cache_stats(top_n: int = 20):
         async with db.execute("SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache") as cur:
             r = await cur.fetchone()
         totals = {"cached_jobs": r[0] or 0, "total_hits": r[1] or 0, "total_cost_saved_usd": r[2] or 0}
-        # job-side stats
-        async with db.execute("SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'") as cur:
-            r2 = await cur.fetchone()
-        totals["jobs_short_circuited"] = r2[0] or 0
+        # Every successful cache short circuit increments exactly one cache row.
+        totals["jobs_short_circuited"] = totals["total_hits"]
         # top cached entries
         async with db.execute(
             "SELECT cache_key, hit_count, cost_saved_usd, model, provider, "
             "datetime(cached_at,'unixepoch') AS cached_at, source_job_id "
             "FROM hive_cache ORDER BY hit_count DESC, cost_saved_usd DESC LIMIT ?",
-            (int(top_n),),
+            (_bounded_result_limit(top_n),),
         ) as cur:
             entries = []
             async for row in cur:
@@ -2052,7 +2081,8 @@ async def list_jobs(
     if since:
         sql += " AND started_at >= ?"
         args.append(since)
-    sql += f" ORDER BY priority DESC, started_at DESC LIMIT {int(limit)}"
+    sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
+    args.append(_bounded_result_limit(limit))
     rows = []
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:
@@ -2093,7 +2123,6 @@ async def publish_message(req: MessagePublish):
             "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (msg_id, req.from_urn, req.to_urn, req.in_reply_to, req.topic, json.dumps(req.payload), now),
         )
-        await db.commit()
         await emit_event(
             db,
             "message",
@@ -2126,7 +2155,8 @@ async def list_messages(
     if since:
         sql += " AND ts >= ?"
         args.append(since)
-    sql += f" ORDER BY ts DESC LIMIT {int(limit)}"
+    sql += " ORDER BY ts DESC LIMIT ?"
+    args.append(_bounded_result_limit(limit))
     rows = []
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:
@@ -2149,7 +2179,7 @@ async def list_messages(
 async def stream_events(request: Request, since_id: Optional[int] = None):
     """SSE stream of events. Optional since_id for catch-up."""
     sub_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_EVENT_QUEUE_SIZE)
     EVENT_QUEUE[sub_id] = queue
 
     async def gen():
@@ -2157,16 +2187,27 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
             # catch-up phase
             if since_id is not None:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    async with db.execute(
-                        "SELECT id, ts, kind, payload FROM events WHERE id > ? ORDER BY id ASC",
-                        (since_id,),
-                    ) as cur:
-                        async for r in cur:
+                    async with db.execute("SELECT COALESCE(MAX(id), ?) FROM events", (since_id,)) as cur:
+                        high_watermark = int((await cur.fetchone())[0])
+                    catchup_cursor = since_id
+                    while catchup_cursor < high_watermark:
+                        batch = []
+                        async with db.execute(
+                            "SELECT id, ts, kind, payload FROM events "
+                            "WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
+                            (catchup_cursor, high_watermark, SSE_CATCHUP_PAGE_SIZE),
+                        ) as cur:
+                            async for r in cur:
+                                batch.append(r)
+                        if not batch:
+                            break
+                        for r in batch:
                             yield {
                                 "id": str(r[0]),
                                 "event": r[2],
                                 "data": json.dumps({"ts": r[1], "kind": r[2], "payload": json.loads(r[3])}),
                             }
+                        catchup_cursor = int(batch[-1][0])
             # live stream
             last_ping = time.time()
             while True:
@@ -2196,7 +2237,8 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
     if since_id is not None:
         sql += " WHERE id > ?"
         args.append(since_id)
-    sql += f" ORDER BY id ASC LIMIT {int(limit)}"
+    sql += " ORDER BY id ASC LIMIT ?"
+    args.append(_bounded_result_limit(limit))
     rows = []
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:

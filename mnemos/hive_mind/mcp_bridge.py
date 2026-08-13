@@ -41,7 +41,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
 from starlette.routing import Mount, Route
 
-from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
+from mnemos.hive_mind.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
 
 HIVE_URL = mcp_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls

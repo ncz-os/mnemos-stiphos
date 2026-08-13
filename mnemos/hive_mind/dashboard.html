@@ -71,6 +71,9 @@
 </div>
 <script id="dashboard-code" type="text/plain">
 const BUS = location.origin;
+const LIVE_REFRESH_MS = __LIVE_REFRESH_MS__;
+const ANALYTICS_REFRESH_MS = __ANALYTICS_REFRESH_MS__;
+let lastAnalyticsRefresh = 0;
 let busToken = window.prompt('Hive bus token (kept in memory until this tab reloads):') || '';
 const authHeaders = () => busToken ? {'Authorization': `Bearer ${busToken}`} : {};
 async function load(path) {
@@ -189,8 +192,16 @@ async function refreshSchedules(){
   }
 }
 async function refreshAll(){
-  document.getElementById('meta').textContent = `last refresh ${new Date().toLocaleTimeString()} · auto-refresh 5s`;
-  try { await Promise.all([refreshAgents(), refreshJobs(), refreshCosts(), refreshCache(), refreshWorkers(), refreshSchedules()]); }
+  document.getElementById('meta').textContent = `last refresh ${new Date().toLocaleTimeString()} · live refresh ${LIVE_REFRESH_MS/1000}s`;
+  try {
+    const refreshes = [refreshAgents(), refreshJobs(), refreshWorkers(), refreshSchedules()];
+    const now = Date.now();
+    if (now - lastAnalyticsRefresh >= ANALYTICS_REFRESH_MS) {
+      refreshes.push(refreshCosts(), refreshCache());
+      lastAnalyticsRefresh = now;
+    }
+    await Promise.all(refreshes);
+  }
   catch(e) { document.getElementById('meta').textContent = 'error: '+e; }
 }
 // Authenticated SSE live event tail. EventSource cannot set bearer headers, so
@@ -222,7 +233,7 @@ async function streamEvents() {
 }
 streamEvents();
 refreshAll();
-setInterval(refreshAll, 5000);
+setInterval(refreshAll, LIVE_REFRESH_MS);
 </script>
 <script src="/dashboard.js"></script>
 </body>
