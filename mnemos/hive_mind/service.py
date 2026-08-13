@@ -723,8 +723,15 @@ async def reaper_task(app: FastAPI):
                 async with db.execute(
                     "SELECT j.id, j.claimed_by FROM jobs j "
                     "LEFT JOIN agents a ON a.urn = j.claimed_by "
+                    # Deliberately NOT keyed on a.status='offline'. That marks an
+                    # agent dead after HEARTBEAT_DEAD_AFTER (60s), which a worker
+                    # busy inside a single long job can exceed, so an actively
+                    # running job was requeued and executed twice. A deregistered
+                    # agent (a.urn IS NULL) is still reaped immediately; a merely
+                    # quiet one is reaped by CLAIM_STALE_AFTER (30min), which is
+                    # the timer actually intended for stalled claims.
                     "WHERE j.status IN ('claimed','running') "
-                    "AND ( a.status = 'offline' OR a.urn IS NULL OR j.claimed_at < ? )",
+                    "AND ( a.urn IS NULL OR j.claimed_at < ? )",
                     (stale_cutoff,),
                 ) as cur:
                     orphans = [(r[0], r[1]) async for r in cur]

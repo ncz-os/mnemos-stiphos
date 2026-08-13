@@ -1222,6 +1222,17 @@ def run_zeroclaw(
                                 job_heartbeat_fn(round(elapsed, 1))
                             except Exception:
                                 pass
+                            # Also keep the AGENT registration alive. The agent
+                            # heartbeat otherwise only fires between jobs, so any
+                            # job running longer than HEARTBEAT_DEAD_AFTER (60s)
+                            # left this worker marked offline WHILE IT WAS WORKING,
+                            # and the reaper requeued the job it was still running
+                            # -- double execution. heartbeat() self-throttles to
+                            # HEARTBEAT_INTERVAL, so this is cheap to call here.
+                            try:
+                                heartbeat()
+                            except Exception:
+                                pass
                             last_job_hb = time.time()
                 last_stdout = _read_output_tail(stdout_file, 12000)
                 last_stderr = _read_output_tail(stderr_file, 4000)
