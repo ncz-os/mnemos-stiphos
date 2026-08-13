@@ -12,11 +12,12 @@
 # shell that records history. Hosts with passwordless sudo (NOPASSWD sudoers,
 # e.g. jasonperlow) leave the value empty and use `sudo -n`.
 #
-# ROTATION: a prior revision of this file committed the ncz sudo password
-# ('***REMOVED-CREDENTIAL***') and a 'mini' password in plaintext. Both are compromised via
-# git history and MUST be rotated on every affected host (bigpi 192.168.207.65,
-# clawpi 192.168.207.54, cixmini) and purged from history (git filter-repo /
-# BFG) before this repo is shared further.
+# ROTATION: a prior revision of this file committed the ncz sudo password and a
+# second host password in plaintext. Both must be treated as compromised via git
+# history and rotated on every affected host (bigpi 192.168.207.65, clawpi
+# 192.168.207.54, cixmini). The values are deliberately NOT repeated here -- a
+# warning that quotes the secret is still a disclosure. History was rewritten
+# with git-filter-repo on 2026-08-13; see the incident record.
 
 set -uo pipefail
 
