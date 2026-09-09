@@ -50,3 +50,36 @@ def test_memory_tools_use_core_v1_routes_and_preserve_tags_as_metadata(monkeypat
         "category": "facts",
         "metadata": {"tags": ["one", "two"]},
     }
+
+
+def test_agent_tools_require_and_forward_explicit_per_agent_token(monkeypatch) -> None:
+    calls = []
+
+    async def fake_hive(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_bridge, "_hive", fake_hive)
+    tools = asyncio.run(mcp_bridge.handle_list_tools())
+    schemas = {tool.name: tool.inputSchema for tool in tools}
+    for name in ("hive.job_create", "hive.job_next", "hive.job_list", "hive.job_update", "hive.message_publish"):
+        assert "agent_token" in schemas[name]["required"]
+
+    asyncio.run(
+        mcp_bridge.handle_call_tool(
+            "hive.job_next",
+            {"agent_urn": "urn:agent:zeroclaw:host:session", "agent_token": "agent-secret"},
+        )
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/v1/jobs/next",
+            {
+                "agent_token": "agent-secret",
+                "params": {"agent_urn": "urn:agent:zeroclaw:host:session"},
+            },
+        )
+    ]
+    assert not hasattr(mcp_bridge, "_AGENT_TOKENS")

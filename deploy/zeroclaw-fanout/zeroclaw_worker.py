@@ -196,6 +196,7 @@ def timeout_for_kind(kind: str) -> int:
 
 
 _urn: str = ""
+_agent_token: str = ""
 _last_heartbeat = 0.0
 _running = True
 _fatal_error = False
@@ -215,8 +216,9 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 10.
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    if HIVE_BUS_TOKEN:
-        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    credential = HIVE_BUS_TOKEN if path.rstrip("/") == "/v1/agents/register" else (_agent_token or HIVE_BUS_TOKEN)
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -371,7 +373,7 @@ def _detect_subscription_pools() -> list[str]:
 def register() -> str:
     """Register with hive. Retry with exponential backoff until success.
     Return an empty URN after shutdown or permanent auth rejection."""
-    global _urn, _last_heartbeat
+    global _urn, _agent_token, _last_heartbeat
     body = {
         "kind": "zeroclaw",
         "runtime": "zeroclaw",
@@ -396,8 +398,9 @@ def register() -> str:
     while _running:
         attempt += 1
         code, resp = _http("POST", "/v1/agents/register", body)
-        if code == 200 and resp and resp.get("urn"):
+        if code == 200 and resp and resp.get("urn") and resp.get("agent_token"):
             _urn = resp["urn"]
+            _agent_token = resp["agent_token"]
             _last_heartbeat = time.time()
             print(f"[zc-worker] registered urn={_urn} (attempt {attempt})", flush=True)
             return _urn
@@ -1212,20 +1215,13 @@ def run_zeroclaw(
                             proc.wait()
                             attempt_timed_out = True
                             break
+                        # Keep the agent lease alive independently of the less
+                        # frequent job-progress update. heartbeat() self-throttles
+                        # to HEARTBEAT_INTERVAL.
+                        heartbeat()
                         if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
                             try:
                                 job_heartbeat_fn(round(elapsed, 1))
-                            except Exception:
-                                pass
-                            # Also keep the AGENT registration alive. The agent
-                            # heartbeat otherwise only fires between jobs, so any
-                            # job running longer than HEARTBEAT_DEAD_AFTER (60s)
-                            # left this worker marked offline WHILE IT WAS WORKING,
-                            # and the reaper requeued the job it was still running
-                            # -- double execution. heartbeat() self-throttles to
-                            # HEARTBEAT_INTERVAL, so this is cheap to call here.
-                            try:
-                                heartbeat()
                             except Exception:
                                 pass
                             last_job_hb = time.time()

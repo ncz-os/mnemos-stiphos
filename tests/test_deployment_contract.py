@@ -34,7 +34,7 @@ def test_dashboard_uses_bearer_auth_for_api_and_event_stream() -> None:
     assert 'script-src \'self\'' in dashboard
 
 
-def test_resubmission_requests_use_configured_bus_token(monkeypatch) -> None:
+def test_resubmission_requests_use_distinct_admin_and_agent_tokens(monkeypatch) -> None:
     path = ROOT / "deploy" / "zeroclaw-fanout" / "resubmit_non_code_jobs.py"
     spec = importlib.util.spec_from_file_location("resubmit_under_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -52,23 +52,28 @@ def test_resubmission_requests_use_configured_bus_token(monkeypatch) -> None:
         def read(self):
             return b'{"jobs": []}'
 
-    monkeypatch.setattr(module, "HIVE_BUS_TOKEN", "bus-secret")
+    monkeypatch.setattr(module, "HIVE_ADMIN_TOKEN", "admin-secret")
+    monkeypatch.setattr(module, "HIVE_AGENT_TOKEN", "agent-secret")
     monkeypatch.setattr(module.urllib.request, "urlopen", lambda req, timeout: (requests.append(req) or Response()))
     module.http_get_jobs("failed")
     module.http_post_job({"kind": "review"})
 
-    assert [request.headers["Authorization"] for request in requests] == ["Bearer bus-secret", "Bearer bus-secret"]
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer admin-secret",
+        "Bearer agent-secret",
+    ]
 
 
-def test_resubmission_fails_fast_without_bus_token(monkeypatch, capsys) -> None:
+def test_resubmission_fails_fast_without_admin_and_agent_tokens(monkeypatch, capsys) -> None:
     path = ROOT / "deploy" / "zeroclaw-fanout" / "resubmit_non_code_jobs.py"
     spec = importlib.util.spec_from_file_location("resubmit_without_token", path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "HIVE_BUS_TOKEN", "")
+    monkeypatch.setattr(module, "HIVE_ADMIN_TOKEN", "")
+    monkeypatch.setattr(module, "HIVE_AGENT_TOKEN", "")
     monkeypatch.setattr(module, "URN", "urn:agent:human:test")
     monkeypatch.setattr(module.urllib.request, "urlopen", lambda *_args: pytest.fail("must not call bus"))
 
     assert module.main() == 1
-    assert "HIVE_BUS_TOKEN or MNEMOS_HIVE_BUS_TOKEN" in capsys.readouterr().out
+    assert "HIVE_ADMIN_TOKEN and HIVE_AGENT_TOKEN" in capsys.readouterr().out

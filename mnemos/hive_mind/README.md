@@ -49,16 +49,19 @@ Jobs default `max_cost_tier="A"`. Workers above the cap get HTTP 204 "no eligibl
 apt install -y python3-fastapi python3-uvicorn python3-aiosqlite python3-sse-starlette python3-pydantic
 install -m 0600 /dev/null /etc/default/graeae-hive
 printf 'HIVE_BUS_TOKEN=%s\n' "$(openssl rand -hex 32)" > /etc/default/graeae-hive
+printf 'HIVE_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >> /etc/default/graeae-hive
 cp service.py /srv/agent-bus/agent_bus.py
 # systemd unit at ../../ops/systemd/graeae-hive.service
 systemctl enable --now graeae-hive.service
 curl http://localhost:5005/health
 ```
 
-All data routes require `Authorization: Bearer $HIVE_BUS_TOKEN` unless
-`HIVE_BUS_AUTH_REQUIRED=0` is explicitly set for isolated development/tests.
-The public dashboard shell prompts for the token and uses it for its protected
-API and SSE requests.
+`HIVE_BUS_TOKEN` bootstraps registration. Each registration returns a unique
+agent bearer token for identity-bound agent operations. Fleet-global reads and
+routing require the distinct `HIVE_ADMIN_TOKEN`. Set
+`HIVE_BUS_AUTH_REQUIRED=0` only for isolated development/tests. The public
+dashboard shell prompts for the admin token and uses it for protected API and
+SSE requests.
 
 ## Deployment folded into mnemos-api (Phase 2)
 
