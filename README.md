@@ -35,23 +35,28 @@ pip install "mnemos-stiphos[mcp]"     # + MCP-SSE bridge
 
 ```bash
 export HIVE_BUS_TOKEN="$(openssl rand -hex 32)"
+export HIVE_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 # From source / pip install
-HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
+HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" HIVE_ADMIN_TOKEN="$HIVE_ADMIN_TOKEN" \
+  uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
 
 # Or the published image (multi-arch amd64 + arm64)
-docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -v stiphos-data:/data \
+docker run -e HIVE_BUS_TOKEN="$HIVE_BUS_TOKEN" -e HIVE_ADMIN_TOKEN="$HIVE_ADMIN_TOKEN" \
+  -v stiphos-data:/data \
   -p 127.0.0.1:8080:8080 ghcr.io/ncz-os/mnemos-stiphos:latest
 ```
 
-All data routes require `Authorization: Bearer $HIVE_BUS_TOKEN` by default;
-`/health` and the dashboard shell at `/` are public. Set
-`HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests. Workers
-and bridges read `HIVE_BUS_TOKEN` or `MNEMOS_HIVE_BUS_TOKEN` and attach the
-bearer token automatically.
+The fleet bearer token is a registration bootstrap credential. Registration
+returns a distinct `agent_token` once; the server stores only its SHA-256 digest,
+and workers use that token for heartbeat, claim, update, submission, and message
+requests. Fleet-global job reads and routing changes require the separate
+`HIVE_ADMIN_TOKEN` (or `MNEMOS_HIVE_ADMIN_TOKEN`), which must not equal the
+bootstrap token. `/health` and the dashboard shell at `/` are public. Set
+`HIVE_BUS_AUTH_REQUIRED=0` only for isolated local development or tests.
 
 The dashboard shell at `/` is public so a browser can load it. It prompts for
-the bus token, keeps it only in tab-scoped `sessionStorage`, and sends it as a
+the admin token, keeps it only in tab-scoped `sessionStorage`, and sends it as a
 bearer header on API and SSE requests. The protected data routes remain closed.
 
 Performance bounds are configurable. Their defaults preserve prior runtime

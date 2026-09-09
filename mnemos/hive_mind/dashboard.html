@@ -74,12 +74,12 @@ const BUS = location.origin;
 const LIVE_REFRESH_MS = __LIVE_REFRESH_MS__;
 const ANALYTICS_REFRESH_MS = __ANALYTICS_REFRESH_MS__;
 let lastAnalyticsRefresh = 0;
-let busToken = window.prompt('Hive bus token (kept in memory until this tab reloads):') || '';
+let busToken = window.prompt('Hive admin token (kept in memory until this tab reloads):') || '';
 const authHeaders = () => busToken ? {'Authorization': `Bearer ${busToken}`} : {};
 async function load(path) {
   const response = await fetch(BUS+path, {headers: authHeaders()});
   if (response.status === 401 || response.status === 503) {
-    throw new Error('authentication failed; reload to enter the Hive bus token');
+    throw new Error('authentication failed; reload to enter the Hive admin token');
   }
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.json();

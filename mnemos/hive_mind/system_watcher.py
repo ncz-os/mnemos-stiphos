@@ -47,6 +47,7 @@ SYSTEM_LOAD_INTERVAL = max(
 CLAIM_JOBS = claim_jobs_enabled_env()
 
 _urn: str = ""
+_agent_token: str = ""
 _running = True
 
 
@@ -64,8 +65,9 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    if HIVE_BUS_TOKEN:
-        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    credential = HIVE_BUS_TOKEN if path.rstrip("/") == "/v1/agents/register" else (_agent_token or HIVE_BUS_TOKEN)
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -244,7 +246,7 @@ def capabilities_from_specs(specs: dict) -> list[str]:
 
 
 def register():
-    global _urn
+    global _urn, _agent_token
     specs = static_specs()
     caps = capabilities_from_specs(specs)
     load = dynamic_load()
@@ -266,8 +268,9 @@ def register():
     }
     # system is a NEW runtime — RUNTIME_KIND_MAP may not include it; service falls back to allowing kind==runtime
     code, resp = _http("POST", "/v1/agents/register", body)
-    if code == 200 and resp:
+    if code == 200 and resp and resp.get("agent_token"):
         _urn = resp["urn"]
+        _agent_token = resp["agent_token"]
         print(f"[sysw] registered urn={_urn} caps={caps}", flush=True)
     else:
         print(f"[sysw] register failed code={code} resp={resp}", flush=True)

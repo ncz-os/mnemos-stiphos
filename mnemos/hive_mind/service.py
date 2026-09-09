@@ -10,6 +10,7 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from mnemos.hive_mind.config import agent_bus_db_env
 
 DB_PATH = agent_bus_db_env()
 HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
+HIVE_ADMIN_TOKEN_ENV_NAMES = ("HIVE_ADMIN_TOKEN", "MNEMOS_HIVE_ADMIN_TOKEN")
 HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 _PUBLIC_PATHS = {"/health", "", "/dashboard.js"}  # dashboard assets collect the API token in-browser
@@ -85,6 +87,14 @@ def _configured_bus_tokens() -> tuple[str, ...]:
     return tuple(dict.fromkeys(tokens))
 
 
+def _configured_admin_tokens() -> tuple[str, ...]:
+    tokens: list[str] = []
+    for name in HIVE_ADMIN_TOKEN_ENV_NAMES:
+        raw = os.environ.get(name, "")
+        tokens.extend(token.strip() for token in raw.split(",") if token.strip())
+    return tuple(dict.fromkeys(tokens))
+
+
 def _hive_bus_auth_required() -> bool:
     return _env_bool(HIVE_BUS_AUTH_REQUIRED_ENV_NAMES, default=True)
 
@@ -102,6 +112,58 @@ def _request_has_valid_bus_token(request: Request, expected_tokens: tuple[str, .
     if supplied is None:
         return False
     return any(secrets.compare_digest(supplied, expected) for expected in expected_tokens)
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _request_role(request: Request) -> str:
+    return getattr(request.state, "hive_auth_role", "disabled" if not _hive_bus_auth_required() else "unknown")
+
+
+def _require_admin(request: Request) -> None:
+    if _request_role(request) == "disabled":
+        return
+    if not _configured_admin_tokens():
+        raise HTTPException(503, "admin authentication is required, but no HIVE_ADMIN_TOKEN is configured")
+    if _request_role(request) != "admin":
+        raise HTTPException(403, "admin credential required")
+
+
+def _require_registration_authority(request: Request) -> None:
+    if _request_role(request) == "disabled":
+        return
+    if _request_role(request) not in {"bootstrap", "admin"}:
+        raise HTTPException(403, "fleet bootstrap credential required")
+
+
+def _require_agent(request: Request, claimed_urn: str | None = None) -> str:
+    if _request_role(request) == "disabled":
+        if not claimed_urn:
+            raise HTTPException(403, "agent identity is required")
+        return claimed_urn
+    if _request_role(request) != "agent":
+        raise HTTPException(403, "per-agent credential required")
+    caller = getattr(request.state, "agent_urn", None)
+    if not caller:
+        raise HTTPException(403, "per-agent credential is not bound to an agent")
+    if claimed_urn and not secrets.compare_digest(caller, claimed_urn):
+        raise HTTPException(403, "claimed agent identity does not match authenticating credential")
+    return caller
+
+
+def _require_owner_or_admin(request: Request, owner_urn: str) -> str:
+    if _request_role(request) == "admin":
+        return owner_urn
+    return _require_agent(request, owner_urn)
+
+
+def _internal_agent_request(agent_urn: str) -> Request:
+    request = Request({"type": "http", "method": "POST", "path": "/internal", "headers": []})
+    request.state.hive_auth_role = "agent"
+    request.state.agent_urn = agent_urn
+    return request
 
 
 def uuidv7() -> str:
@@ -160,6 +222,12 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_kind ON agents(kind);
+
+CREATE TABLE IF NOT EXISTS agent_credentials (
+  urn TEXT PRIMARY KEY REFERENCES agents(urn) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  issued_at REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -580,14 +648,14 @@ async def _claim_agent_context(agent_urn: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd "
+            "auth_method, plan_cap_usd, plan_period_used_usd, subscription_pools "
             "FROM agents WHERE urn=? AND status IN ('online','idle')",
             (agent_urn,),
         ) as cur:
             row = await cur.fetchone()
     if not row:
         raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
-    agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
+    agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used, pools_json = row
     agent_caps = set(json.loads(caps_json)) if caps_json else set()
     a_tier = a_tier or "C"
     executable_tiers = [tier for tier in COST_TIERS if f"cost-tier:{tier}" in agent_caps]
@@ -608,7 +676,50 @@ async def _claim_agent_context(agent_urn: str) -> dict:
         "agent_provider": a_provider or "unknown",
         "agent_tier": a_tier,
         "sub_throttled": bool(sub_throttled),
+        "subscription_pools": set(json.loads(pools_json)) if pools_json else set(),
     }
+
+
+async def _job_is_visible_claim_candidate(row: tuple, agent: dict, now: float) -> bool:
+    """Return whether an unowned queued job is presently claimable by an agent."""
+    required_caps = set(json.loads(row[11])) if row[11] else set()
+    if required_caps and not required_caps.issubset(agent["agent_caps"]):
+        return False
+    eligible_kinds = set(json.loads(row[12])) if row[12] else set()
+    if eligible_kinds and agent["agent_kind"] not in eligible_kinds:
+        return False
+    max_tier = (row[13] or "A").upper()
+    try:
+        if COST_TIERS.index(agent["agent_tier"]) > COST_TIERS.index(max_tier):
+            return False
+    except ValueError:
+        return False
+    if agent["sub_throttled"] and max_tier != "A":
+        return False
+    depends_on = json.loads(row[17]) if row[17] else []
+    if depends_on:
+        placeholders = ",".join("?" for _ in depends_on)
+        async with (
+            aiosqlite.connect(DB_PATH) as db,
+            db.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+                tuple(depends_on),
+            ) as cur,
+        ):
+            done_count = int((await cur.fetchone())[0])
+        if done_count != len(depends_on):
+            return False
+    retry_backoff_until = row[20]
+    if retry_backoff_until is not None and retry_backoff_until > now:
+        return False
+    routing_metadata = json.loads(row[19]) if row[19] else {}
+    required_pools = {
+        str(pool).strip().lower()
+        for pool in (routing_metadata.get("required_subscription_pools") or [])
+        if str(pool).strip()
+    }
+    agent_pools = {str(pool).strip().lower() for pool in agent["subscription_pools"]}
+    return not required_pools or bool(required_pools.intersection(agent_pools))
 
 
 class AgentRegister(BaseModel):
@@ -715,65 +826,68 @@ class MessagePublish(BaseModel):
 
 # ---------- lifecycle ----------
 
-CLAIM_STALE_AFTER = 1800.0  # claim → still 'claimed'/'running' without update >30min ⇒ orphan
+async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
+    """Mark stale agents offline and atomically release only their owned jobs."""
+    cutoff = now - HEARTBEAT_DEAD_AFTER
+    offline_count = 0
+    requeued_count = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
+            (cutoff,),
+        ) as cur:
+            stale_agents = [row[0] async for row in cur]
+        for urn in stale_agents:
+            updated = await db.execute(
+                "UPDATE agents SET status='offline' "
+                "WHERE urn=? AND status != 'offline' AND last_heartbeat < ?",
+                (urn, cutoff),
+            )
+            if updated.rowcount == 1:
+                offline_count += 1
+                await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
+
+        async with db.execute(
+            "SELECT j.id, j.claimed_by FROM jobs j "
+            "LEFT JOIN agents a ON a.urn=j.claimed_by "
+            "WHERE j.status IN ('claimed','running') "
+            "AND (a.urn IS NULL OR a.last_heartbeat < ?)",
+            (cutoff,),
+        ) as cur:
+            orphan_candidates = [(row[0], row[1]) async for row in cur]
+        for job_id, claimer in orphan_candidates:
+            updated = await db.execute(
+                "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+                "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
+                "claimed_cost_tier=NULL "
+                "WHERE id=? AND claimed_by=? AND status IN ('claimed','running') "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM agents WHERE urn=? AND last_heartbeat >= ?"
+                ")",
+                (job_id, claimer, claimer, cutoff),
+            )
+            if updated.rowcount == 1:
+                requeued_count += 1
+                await emit_event(
+                    db,
+                    "job.unclaimed",
+                    {
+                        "id": job_id,
+                        "prior_claimer": claimer,
+                        "reason": "worker_heartbeat_stale_or_missing",
+                    },
+                )
+        await db.commit()
+    return offline_count, requeued_count
 
 
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
+            await _reap_stale_agents_and_jobs(time.time())
             async with aiosqlite.connect(DB_PATH) as db:
-                # 1. Heartbeat reaper — mark dead agents offline
-                cutoff = time.time() - HEARTBEAT_DEAD_AFTER
-                async with db.execute(
-                    "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
-                    (cutoff,),
-                ) as cur:
-                    dead = [row[0] async for row in cur]
-                if dead:
-                    await db.executemany(
-                        "UPDATE agents SET status='offline' WHERE urn=?",
-                        [(u,) for u in dead],
-                    )
-                    await db.commit()
-                    for urn in dead:
-                        await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
-                # 2. ORPHAN CLAIM RECOVERY — jobs claimed by dead/stale workers go back to queue
-                stale_cutoff = time.time() - CLAIM_STALE_AFTER
-                async with db.execute(
-                    "SELECT j.id, j.claimed_by FROM jobs j "
-                    "LEFT JOIN agents a ON a.urn = j.claimed_by "
-                    # Deliberately NOT keyed on a.status='offline'. That marks an
-                    # agent dead after HEARTBEAT_DEAD_AFTER (60s), which a worker
-                    # busy inside a single long job can exceed, so an actively
-                    # running job was requeued and executed twice. A deregistered
-                    # agent (a.urn IS NULL) is still reaped immediately; a merely
-                    # quiet one is reaped by CLAIM_STALE_AFTER (30min), which is
-                    # the timer actually intended for stalled claims.
-                    "WHERE j.status IN ('claimed','running') "
-                    "AND ( a.urn IS NULL OR j.claimed_at < ? )",
-                    (stale_cutoff,),
-                ) as cur:
-                    orphans = [(r[0], r[1]) async for r in cur]
-                if orphans:
-                    for job_id, claimer in orphans:
-                        await db.execute(
-                            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
-                            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL WHERE id=? AND status IN ('claimed','running')",
-                            (job_id,),
-                        )
-                        await emit_event(
-                            db,
-                            "job.unclaimed",
-                            {
-                                "id": job_id,
-                                "prior_claimer": claimer,
-                                "reason": "worker_offline_or_stale_claim",
-                            },
-                        )
-                    await db.commit()
-                # 3. Scheduler — fire due interval-based jobs
+                # Scheduler — fire due interval-based jobs
                 now_ts = time.time()
                 async with db.execute(
                     "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
@@ -786,7 +900,7 @@ async def reaper_task(app: FastAPI):
                         tpl = json.loads(tpl_json)
                         tpl["submitter_urn"] = sub_urn
                         # synth a JobCreate + go through the cache+role machinery
-                        await create_job(JobCreate(**tpl))  # type: ignore
+                        await create_job(JobCreate(**tpl), _internal_agent_request(sub_urn))
                         await db.execute(
                             "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
                             "fire_count=fire_count+1 WHERE id=?",
@@ -915,6 +1029,7 @@ async def require_hive_bus_bearer(request: Request, call_next):
     if request.url.path.rstrip("/") in _PUBLIC_PATHS:
         return await call_next(request)
     if not _hive_bus_auth_required():
+        request.state.hive_auth_role = "disabled"
         return await call_next(request)
 
     expected_tokens = _configured_bus_tokens()
@@ -928,8 +1043,41 @@ async def require_hive_bus_bearer(request: Request, call_next):
                 )
             },
         )
-    if not _request_has_valid_bus_token(request, expected_tokens):
+    admin_tokens = _configured_admin_tokens()
+    if any(admin in expected_tokens for admin in admin_tokens):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "HIVE_ADMIN_TOKEN must be distinct from HIVE_BUS_TOKEN"},
+        )
+    supplied = _bearer_token(request)
+    if supplied is None:
         return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
+    if any(secrets.compare_digest(supplied, token) for token in admin_tokens):
+        request.state.hive_auth_role = "admin"
+    elif any(secrets.compare_digest(supplied, token) for token in expected_tokens):
+        request.state.hive_auth_role = "bootstrap"
+    else:
+        try:
+            async with (
+                aiosqlite.connect(DB_PATH) as db,
+                db.execute(
+                    "SELECT c.urn FROM agent_credentials c JOIN agents a ON a.urn=c.urn "
+                    "WHERE c.token_hash=?",
+                    (_token_hash(supplied),),
+                ) as cur,
+            ):
+                row = await cur.fetchone()
+        except aiosqlite.OperationalError:
+            row = None
+        if not row:
+            return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
+        request.state.hive_auth_role = "agent"
+        request.state.agent_urn = row[0]
+    if request.url.path.rstrip("/") == "/v1/agents/register" and _request_role(request) not in {
+        "bootstrap",
+        "admin",
+    }:
+        return JSONResponse(status_code=403, content={"detail": "fleet bootstrap credential required"})
     return await call_next(request)
 
 
@@ -1045,6 +1193,7 @@ async def register(req: AgentRegister):
     tier = cost_tier_for(provider)
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
+    agent_token = secrets.token_urlsafe(32)
     now = time.time()
     # Phase 2 cut 1: INSERT delegated to SqliteHiveMindRepository.insert_agent.
     # emit_event stays inline (separate transaction is acceptable — event log
@@ -1070,6 +1219,11 @@ async def register(req: AgentRegister):
         metadata=req.metadata,
     )
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO agent_credentials (urn, token_hash, issued_at) VALUES (?, ?, ?)",
+            (urn, _token_hash(agent_token), now),
+        )
+        await db.commit()
         await emit_event(
             db,
             "agent.online",
@@ -1088,6 +1242,7 @@ async def register(req: AgentRegister):
         await db.commit()
     return {
         "urn": urn,
+        "agent_token": agent_token,
         "session_id": session_id,
         "registered_at": now,
         "kind": kind,
@@ -1103,16 +1258,17 @@ async def register(req: AgentRegister):
 
 
 @app.post("/v1/agents/heartbeat")
-async def heartbeat(req: AgentHeartbeat):
+async def heartbeat(req: AgentHeartbeat, request: Request):
+    caller = _require_agent(request, req.urn)
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "UPDATE agents SET last_heartbeat=?, status=? WHERE urn=?",
-            (now, req.status, req.urn),
+            (now, req.status, caller),
         )
         await db.commit()
         if cur.rowcount == 0:
-            raise HTTPException(404, f"agent not found: {req.urn}")
+            raise HTTPException(404, f"agent not found: {caller}")
     return {"ack": True, "ts": now}
 
 
@@ -1214,8 +1370,9 @@ async def agent_throttle(urn_path: str):
 
 
 @app.post("/v1/agents/{urn_path:path}/plan-reset")
-async def reset_plan_period(urn_path: str):
+async def reset_plan_period(urn_path: str, request: Request):
     """Operator zeros the MTD usage — call monthly on billing rollover."""
+    _require_admin(request)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
         await db.commit()
@@ -1251,7 +1408,7 @@ async def whoami(host: str, pid: int):
 
 
 @app.post("/v1/jobs")
-async def create_job(req: JobCreate):
+async def create_job(req: JobCreate, request: Request):
     """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
 
     ROLE ENFORCEMENT (user directive 2026-05-23):
@@ -1259,6 +1416,7 @@ async def create_job(req: JobCreate):
     Posting jobs requires submitter to be registered with an orchestrator runtime (claude-code/human/mnemos).
     Workers attempting to POST jobs get 403 — they should call /v1/jobs/next instead.
     """
+    _require_agent(request, req.submitter_urn)
     job_id = uuidv7()
     now = time.time()
     repo_directive = re.match(r"^\s*\[repo:(?P<body>[^]]+)\]", req.description or "", re.IGNORECASE)
@@ -1424,7 +1582,7 @@ async def create_job(req: JobCreate):
 
 
 @app.post("/v1/jobs/next")
-async def dequeue_next_job(agent_urn: str):
+async def dequeue_next_job(request: Request, agent_urn: str | None = None):
     """Atomic dequeue: highest-priority queued job that this agent is eligible for.
 
     Self-assignment for swarm: agent calls this in its main loop. Server:
@@ -1435,6 +1593,7 @@ async def dequeue_next_job(agent_urn: str):
 
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
+    agent_urn = _require_agent(request, agent_urn)
     now = time.time()
     agent = await _claim_agent_context(agent_urn)
 
@@ -1472,19 +1631,22 @@ async def dequeue_next_job(agent_urn: str):
 
 
 @app.patch("/v1/jobs/{job_id}")
-async def update_job(job_id: str, req: JobUpdate):
+async def update_job(job_id: str, req: JobUpdate, request: Request):
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as state_db:
         async with state_db.execute(
-            "SELECT status, claimed_by, max_cost_tier, routing_metadata FROM jobs WHERE id=?", (job_id,)
+            "SELECT status, claimed_by, max_cost_tier, routing_metadata, submitter_urn FROM jobs WHERE id=?",
+            (job_id,),
         ) as state_cur:
             state_row = await state_cur.fetchone()
     if not state_row:
         raise HTTPException(404, f"job not found: {job_id}")
-    current_status, current_claimer, current_cap, routing_metadata_json = state_row
+    current_status, current_claimer, current_cap, routing_metadata_json, submitter_urn = state_row
+    caller = _require_agent(request, req.claimed_by)
     allowed_transitions = {
-        "queued": {"claimed", "cancelled"},
-        "offered": {"claimed", "queued", "cancelled"},
+        # Claiming is exclusively handled by the eligibility-checked CAS routes.
+        "queued": {"cancelled"},
+        "offered": {"queued", "cancelled"},
         "claimed": {"running", "queued", "done", "failed", "cancelled"},
         "running": {"running", "queued", "done", "failed", "cancelled"},
         "done": set(),
@@ -1493,15 +1655,13 @@ async def update_job(job_id: str, req: JobUpdate):
     }
     if req.status != current_status and req.status not in allowed_transitions.get(current_status, set()):
         raise HTTPException(409, f"invalid job transition: {current_status} -> {req.status}")
-    # Fail CLOSED. The guard used to require req.claimed_by to be supplied, so a
-    # caller could transition someone else's job simply by omitting the field --
-    # the check it was meant to enforce was opt-in for the party it constrains.
-    # If the job is claimed, the caller must prove which worker it is.
     if current_claimer:
-        if not req.claimed_by:
-            raise HTTPException(409, "job is claimed; claimed_by is required to update it")
-        if req.claimed_by != current_claimer:
-            raise HTTPException(409, "job is owned by a different worker")
+        if caller != current_claimer:
+            raise HTTPException(403, "job is owned by a different worker")
+    elif caller != submitter_urn:
+        raise HTTPException(403, "only the submitter may mutate an unclaimed job")
+    if current_status in {"done", "failed", "cancelled"} and req.status == current_status:
+        return {"ok": True, "duplicate": True, "ts": now}
 
     reported_provider = None
     reported_model = None
@@ -1606,12 +1766,9 @@ async def update_job(job_id: str, req: JobUpdate):
     # concurrent re-claim between the SELECT above and this UPDATE cannot let
     # the losing worker write the winner's row.
     ownership_guard = ""
-    if req.claimed_by:
+    if current_claimer:
         ownership_guard = " AND claimed_by=?"
-        args.append(req.claimed_by)
-    elif current_claimer:
-        ownership_guard = " AND claimed_by=?"
-        args.append(current_claimer)
+        args.append(caller)
     sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status=?{ownership_guard}"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)
@@ -1750,7 +1907,7 @@ async def update_job(job_id: str, req: JobUpdate):
             f"job.{req.status}",
             {
                 "id": job_id,
-                "claimed_by": req.claimed_by,
+                "claimed_by": caller,
                 "tokens_in": req.tokens_in,
                 "tokens_out": req.tokens_out,
                 "estimated_cost_usd": cost_estimate,
@@ -1760,8 +1917,9 @@ async def update_job(job_id: str, req: JobUpdate):
 
 
 @app.patch("/v1/jobs/{job_id}/routing")
-async def route_job(job_id: str, req: JobRoutingUpdate):
+async def route_job(job_id: str, req: JobRoutingUpdate, request: Request):
     """Apply KNEMON/Hive triage metadata to a queued job before workers claim it."""
+    _require_admin(request)
     now = time.time()
     updated = await _REPO.update_job_routing(
         job_id=job_id,
@@ -1793,17 +1951,21 @@ async def route_job(job_id: str, req: JobRoutingUpdate):
 
 
 @app.post("/v1/schedules")
-async def create_schedule(req: ScheduleCreate):
+async def create_schedule(req: ScheduleCreate, request: Request):
     """Create a recurring scheduled job. Re-fires every `interval_seconds`.
     job_template is the JobCreate body that will be submitted each tick.
     Submitter_urn auto-injected from caller — they take responsibility for the cron loop.
     """
     sid = uuidv7()
     now = time.time()
+    tpl_copy = dict(req.job_template)
+    asserted_submitter = tpl_copy.get("submitter_urn")
+    if _request_role(request) == "disabled" and not asserted_submitter:
+        asserted_submitter = "urn:agent:human:scheduler-placeholder"
+    caller = _require_agent(request, asserted_submitter)
+    tpl_copy["submitter_urn"] = caller
     # Validate the template parses as a JobCreate
     try:
-        tpl_copy = dict(req.job_template)
-        tpl_copy.setdefault("submitter_urn", "urn:agent:human:scheduler-placeholder")
         JobCreate(**tpl_copy)
     except Exception as e:
         raise HTTPException(422, f"job_template invalid: {e}")
@@ -1817,7 +1979,7 @@ async def create_schedule(req: ScheduleCreate):
                 req.name,
                 tpl_copy.get("submitter_urn"),
                 int(req.interval_seconds),
-                json.dumps(req.job_template),
+                json.dumps(tpl_copy),
                 1 if req.enabled else 0,
                 now + req.interval_seconds,
                 now,
@@ -1853,7 +2015,20 @@ async def list_schedules():
 
 
 @app.patch("/v1/schedules/{sid}")
-async def patch_schedule(sid: str, enabled: Optional[bool] = None, interval_seconds: Optional[int] = None):
+async def patch_schedule(
+    sid: str,
+    request: Request,
+    enabled: bool | None = None,
+    interval_seconds: int | None = None,
+):
+    async with (
+        aiosqlite.connect(DB_PATH) as auth_db,
+        auth_db.execute("SELECT created_by_urn FROM scheduled_jobs WHERE id=?", (sid,)) as cur,
+    ):
+        owner = await cur.fetchone()
+    if not owner:
+        raise HTTPException(404, "schedule not found")
+    _require_owner_or_admin(request, owner[0])
     sets, args = [], []
     if enabled is not None:
         sets.append("enabled=?")
@@ -1877,7 +2052,15 @@ async def patch_schedule(sid: str, enabled: Optional[bool] = None, interval_seco
 
 
 @app.delete("/v1/schedules/{sid}")
-async def delete_schedule(sid: str):
+async def delete_schedule(sid: str, request: Request):
+    async with (
+        aiosqlite.connect(DB_PATH) as auth_db,
+        auth_db.execute("SELECT created_by_urn FROM scheduled_jobs WHERE id=?", (sid,)) as cur,
+    ):
+        owner = await cur.fetchone()
+    if not owner:
+        raise HTTPException(404, "schedule not found")
+    _require_owner_or_admin(request, owner[0])
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
         await db.commit()
@@ -2020,8 +2203,9 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 
 
 @app.post("/v1/jobs/{job_id}/claim")
-async def claim_job(job_id: str, by: str):
+async def claim_job(job_id: str, request: Request, by: str | None = None):
     """First-write-wins claim after the same eligibility gates as /v1/jobs/next."""
+    by = _require_agent(request, by)
     now = time.time()
     agent = await _claim_agent_context(by)
     status, claimed = await _REPO.claim_job_by_id(
@@ -2060,33 +2244,59 @@ async def claim_job(job_id: str, by: str):
 
 @app.get("/v1/jobs")
 async def list_jobs(
+    request: Request = None,
     status: Optional[str] = None,
     agent_urn: Optional[str] = None,
     since: Optional[float] = None,
     limit: int = 100,
 ):
+    if request is None:
+        request = Request({"type": "http", "method": "GET", "path": "/internal", "headers": []})
+        request.state.hive_auth_role = "disabled"
+    role = _request_role(request)
+    caller: str | None = None
+    agent: dict | None = None
+    if role == "agent":
+        caller = _require_agent(request, agent_urn)
+        agent = await _claim_agent_context(caller)
+    elif role == "admin":
+        caller = None
+    elif role == "disabled":
+        caller = agent_urn
+    else:
+        raise HTTPException(403, "per-agent or admin credential required")
     sql = (
         "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, "
         "started_at, ended_at, result, required_capabilities, eligible_kinds, max_cost_tier, "
-        "preferred_providers, preferred_models, mnemos_refs, depends_on, routed_at, routing_metadata "
+        "preferred_providers, preferred_models, mnemos_refs, depends_on, routed_at, routing_metadata, "
+        "retry_backoff_until "
         "FROM jobs WHERE 1=1"
     )
     args: list = []
     if status:
         sql += " AND status=?"
         args.append(status)
-    if agent_urn:
+    if role == "agent":
+        sql += " AND (submitter_urn=? OR claimed_by=? OR (status IN ('queued','offered') AND claimed_by IS NULL))"
+        args.extend([caller, caller])
+    elif agent_urn:
         sql += " AND (submitter_urn=? OR claimed_by=?)"
         args.extend([agent_urn, agent_urn])
     if since:
         sql += " AND started_at >= ?"
         args.append(since)
-    sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
-    args.append(_bounded_result_limit(limit))
+    sql += " ORDER BY priority DESC, started_at DESC"
+    if role != "agent":
+        sql += " LIMIT ?"
+        args.append(_bounded_result_limit(limit))
     rows = []
+    now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
+                owned = role != "agent" or r[1] == caller or r[7] == caller
+                if not owned and (not agent or not await _job_is_visible_claim_candidate(tuple(r), agent, now)):
+                    continue
                 rows.append(
                     {
                         "id": r[0],
@@ -2111,11 +2321,14 @@ async def list_jobs(
                         "routing_metadata": json.loads(r[19]) if r[19] else None,
                     }
                 )
+                if len(rows) >= _bounded_result_limit(limit):
+                    break
     return {"count": len(rows), "jobs": rows}
 
 
 @app.post("/v1/messages")
-async def publish_message(req: MessagePublish):
+async def publish_message(req: MessagePublish, request: Request):
+    _require_agent(request, req.from_urn)
     msg_id = uuidv7()
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2261,7 +2474,7 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
 
 
 @app.post("/mcp")
-async def mcp_rpc(body: dict):
+async def mcp_rpc(body: dict, request: Request):
     method = body.get("method", "")
     params = body.get("params", {})
     handlers = {
@@ -2278,18 +2491,21 @@ async def mcp_rpc(body: dict):
     # crude param coercion - production MCP would use proper validation
     try:
         if method == "agent.register":
+            _require_registration_authority(request)
             return await register(AgentRegister(**params))
         if method == "agent.heartbeat":
-            return await heartbeat(AgentHeartbeat(**params))
+            return await heartbeat(AgentHeartbeat(**params), request)
         if method == "agent.list":
             return await list_agents(**params)
         if method == "job.create":
-            return await create_job(JobCreate(**params))
+            return await create_job(JobCreate(**params), request)
         if method == "job.list":
-            return await list_jobs(**params)
+            return await list_jobs(request=request, **params)
         if method == "message.publish":
-            return await publish_message(MessagePublish(**params))
+            return await publish_message(MessagePublish(**params), request)
         if method == "message.list":
             return await list_messages(**params)
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)

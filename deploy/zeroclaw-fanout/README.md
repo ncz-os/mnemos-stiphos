@@ -90,6 +90,7 @@ interactive subscription access. Use family-specific pools by default:
 
 ```bash
 HIVE_BUS_TOKEN=<same bearer token configured on graeae-hive>
+HIVE_ADMIN_TOKEN=<distinct operator token used only by the triage daemon>
 MNEMOS_URL=http://192.168.207.67:5002
 MNEMOS_TOKEN=<root token used to reconcile KNEMON route reservations>
 CHATGPT_PLAN=chatgpt_pro_100          # or chatgpt_plus / chatgpt_pro_200

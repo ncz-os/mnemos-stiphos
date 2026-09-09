@@ -165,6 +165,7 @@ def test_agent_output_is_redirected_to_files_not_blocking_pipes(monkeypatch: pyt
 
 def test_per_attempt_timeout_advances_provider_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     processes = []
+    heartbeats = []
 
     class HungProcess:
         returncode = None
@@ -193,16 +194,18 @@ def test_per_attempt_timeout_advances_provider_chain(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(worker, "_load_registry", lambda: None)
     aliases = [worker._PRIMARY_BC, "hive_ngc_2"]
     monkeypatch.setattr(worker, "_HARDCODED_FALLBACK", {"A": aliases, "B": aliases, "C": aliases})
-    monkeypatch.setattr(worker, "PER_ATTEMPT_TIMEOUT", 10)
+    monkeypatch.setattr(worker, "PER_ATTEMPT_TIMEOUT", 50)
     monkeypatch.setattr(worker, "ZEROCLAW_TIMEOUT", 300)
     monkeypatch.setattr(worker.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(worker.time, "time", fake_time)
+    monkeypatch.setattr(worker, "heartbeat", lambda: heartbeats.append(True))
 
     result = worker.run_zeroclaw("hang", max_cost_tier="A")
 
     assert len(processes) == 2
     assert all(proc.killed for proc in processes)
     assert result["providers_attempted"] == aliases
+    assert len(heartbeats) >= 2
 
 
 def test_knemon_reservation_is_reconciled_with_execution_usage(monkeypatch: pytest.MonkeyPatch) -> None:

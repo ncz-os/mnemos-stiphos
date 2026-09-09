@@ -47,6 +47,7 @@ HIVE_URL = mcp_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN") or os.environ.get("MNEMOS_HIVE_BUS_TOKEN", "")
+HIVE_ADMIN_TOKEN = os.environ.get("HIVE_ADMIN_TOKEN") or os.environ.get("MNEMOS_HIVE_ADMIN_TOKEN", "")
 MNEMOS_URL = mcp_mnemos_url_env()
 MNEMOS_TOKEN = mcp_mnemos_token_env()
 GRAEAE_ENABLED = os.environ.get("MCP_GRAEAE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -65,11 +66,21 @@ def _register(name: str):
     return decorator
 
 
-async def _hive(method: str, path: str, **kw) -> dict:
-    if HIVE_BUS_TOKEN:
-        headers = dict(kw.pop("headers", {}) or {})
-        headers.setdefault("Authorization", f"Bearer {HIVE_BUS_TOKEN}")
-        kw["headers"] = headers
+async def _hive(
+    method: str,
+    path: str,
+    *,
+    agent_token: str | None = None,
+    admin: bool = False,
+    bootstrap: bool = False,
+    **kw,
+) -> dict:
+    credential = HIVE_ADMIN_TOKEN if admin else (HIVE_BUS_TOKEN if bootstrap else agent_token)
+    if not credential:
+        raise RuntimeError("the required Hive credential was not supplied")
+    headers = dict(kw.pop("headers", {}) or {})
+    headers.setdefault("Authorization", f"Bearer {credential}")
+    kw["headers"] = headers
     r = await client.request(method, f"{HIVE_URL}{path}", **kw)
     r.raise_for_status()
     if r.status_code == 204:
@@ -98,7 +109,7 @@ async def handle_list_tools() -> list[Tool]:
         ),
         Tool(
             name="hive.agent_register",
-            description="Register this session as an agent in the Hive. Returns urn + session_id.",
+            description="Register this session as an agent in the Hive. Returns urn, session_id, and a one-time agent_token.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -121,6 +132,11 @@ async def handle_list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "submitter_urn": {"type": "string"},
+                    "agent_token": {
+                        "type": "string",
+                        "description": "Per-agent token returned by registration.",
+                        "writeOnly": True,
+                    },
                     "kind": {"type": "string"},
                     "description": {"type": "string"},
                     "priority": {"type": "integer", "default": 0},
@@ -129,13 +145,24 @@ async def handle_list_tools() -> list[Tool]:
                     "deadline": {"type": "number"},
                     "parent_job_id": {"type": "string"},
                 },
-                "required": ["submitter_urn", "kind"],
+                "required": ["submitter_urn", "agent_token", "kind"],
             },
         ),
         Tool(
             name="hive.job_next",
             description="Atomic dequeue: claim highest-priority eligible job for this agent. Returns job or {204: no work}.",
-            inputSchema={"type": "object", "properties": {"agent_urn": {"type": "string"}}, "required": ["agent_urn"]},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_urn": {"type": "string"},
+                    "agent_token": {
+                        "type": "string",
+                        "description": "Per-agent token returned by registration.",
+                        "writeOnly": True,
+                    },
+                },
+                "required": ["agent_urn", "agent_token"],
+            },
         ),
         Tool(
             name="hive.job_list",
@@ -145,9 +172,15 @@ async def handle_list_tools() -> list[Tool]:
                 "properties": {
                     "status": {"type": "string"},
                     "agent_urn": {"type": "string"},
+                    "agent_token": {
+                        "type": "string",
+                        "description": "Per-agent token returned by registration.",
+                        "writeOnly": True,
+                    },
                     "since": {"type": "number"},
                     "limit": {"type": "integer", "default": 100},
                 },
+                "required": ["agent_urn", "agent_token"],
             },
         ),
         Tool(
@@ -172,8 +205,13 @@ async def handle_list_tools() -> list[Tool]:
                         },
                     },
                     "claimed_by": {"type": "string"},
+                    "agent_token": {
+                        "type": "string",
+                        "description": "Per-agent token returned by registration.",
+                        "writeOnly": True,
+                    },
                 },
-                "required": ["id", "status"],
+                "required": ["id", "status", "agent_token"],
             },
         ),
         Tool(
@@ -183,12 +221,17 @@ async def handle_list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "from_urn": {"type": "string"},
+                    "agent_token": {
+                        "type": "string",
+                        "description": "Per-agent token returned by registration.",
+                        "writeOnly": True,
+                    },
                     "to_urn": {"type": "string"},
                     "topic": {"type": "string"},
                     "payload": {"type": "object"},
                     "in_reply_to": {"type": "string"},
                 },
-                "required": ["from_urn", "topic", "payload"],
+                "required": ["from_urn", "agent_token", "topic", "payload"],
             },
         ),
         Tool(
@@ -300,22 +343,34 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
                 )
             ]
         if name == "hive.agent_list":
-            r = await _hive("GET", "/v1/agents", params={k: v for k, v in args.items() if v})
+            r = await _hive("GET", "/v1/agents", bootstrap=True, params={k: v for k, v in args.items() if v})
         elif name == "hive.agent_register":
-            r = await _hive("POST", "/v1/agents/register", json=args)
+            r = await _hive("POST", "/v1/agents/register", bootstrap=True, json=args)
         elif name == "hive.job_create":
-            r = await _hive("POST", "/v1/jobs", json=args)
+            payload = dict(args)
+            agent_token = payload.pop("agent_token", None)
+            r = await _hive("POST", "/v1/jobs", agent_token=agent_token, json=payload)
         elif name == "hive.job_next":
-            r = await _hive("POST", f"/v1/jobs/next", params={"agent_urn": args["agent_urn"]})
+            r = await _hive(
+                "POST",
+                "/v1/jobs/next",
+                agent_token=args.get("agent_token"),
+                params={"agent_urn": args["agent_urn"]},
+            )
         elif name == "hive.job_list":
-            r = await _hive("GET", "/v1/jobs", params={k: v for k, v in args.items() if v})
+            params = {k: v for k, v in args.items() if v and k != "agent_token"}
+            r = await _hive("GET", "/v1/jobs", agent_token=args.get("agent_token"), params=params)
         elif name == "hive.job_update":
-            jid = args.pop("id")
-            r = await _hive("PATCH", f"/v1/jobs/{jid}", json=args)
+            payload = dict(args)
+            jid = payload.pop("id")
+            agent_token = payload.pop("agent_token", None)
+            r = await _hive("PATCH", f"/v1/jobs/{jid}", agent_token=agent_token, json=payload)
         elif name == "hive.message_publish":
-            r = await _hive("POST", "/v1/messages", json=args)
+            payload = dict(args)
+            agent_token = payload.pop("agent_token", None)
+            r = await _hive("POST", "/v1/messages", agent_token=agent_token, json=payload)
         elif name == "hive.message_list":
-            r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
+            r = await _hive("GET", "/v1/messages", bootstrap=True, params={k: v for k, v in args.items() if v})
         elif name == "mnemos.memory_search":
             r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos.memory_create":

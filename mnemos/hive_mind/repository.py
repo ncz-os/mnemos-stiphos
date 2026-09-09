@@ -234,6 +234,11 @@ class SqliteHiveMindRepository:
                   status TEXT NOT NULL CHECK(status IN ('online','idle','offline','error')),
                   metadata TEXT
                 );
+                CREATE TABLE IF NOT EXISTS agent_credentials (
+                  urn TEXT PRIMARY KEY REFERENCES agents(urn) ON DELETE CASCADE,
+                  token_hash TEXT NOT NULL UNIQUE,
+                  issued_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS jobs (
                   id TEXT PRIMARY KEY,
                   submitter_urn TEXT NOT NULL,
