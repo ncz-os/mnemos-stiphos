@@ -269,7 +269,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   tokens_out INTEGER,
   estimated_cost_usd REAL,
   retry_count INTEGER NOT NULL DEFAULT 0,
-  max_retries INTEGER NOT NULL DEFAULT 2
+  max_retries INTEGER NOT NULL DEFAULT 2,
+  -- F03 (2026-09-14): per-claim fencing token + attempt generation.
+  -- A successful claim mints a fresh UUID token AND bumps attempt_generation
+  -- atomically; the SAME agent (or any other) cannot complete a later claim
+  -- with the stale token from a previous attempt. Reaper -> requeue resets
+  -- attempt_generation to a new value (the new claim bumps it again).
+  claim_token TEXT,
+  attempt_generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn);
@@ -279,6 +286,30 @@ CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);  -- #10 FIX
 CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until);
 CREATE INDEX IF NOT EXISTS idx_jobs_costs ON jobs(ended_at, claimed_provider, claimed_model);
+
+-- F03 (2026-09-14): immutable per-claim audit record. One row per claim
+-- attempt (including reaped/requeued/cancelled attempts), so a stale
+-- completion can be diagnosed after the fact, not just rejected at the
+-- CAS boundary.
+CREATE TABLE IF NOT EXISTS job_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_by TEXT,
+  claimed_at REAL,
+  outcome TEXT NOT NULL DEFAULT 'in_flight'
+    CHECK(outcome IN ('in_flight','completed','failed','cancelled','reaped')),
+  outcome_at REAL,
+  result TEXT,
+  released_by TEXT,
+  released_at REAL,
+  release_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id
+  ON job_attempts(job_id, attempt_generation);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_outcome
+  ON job_attempts(outcome);
 
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
   id TEXT PRIMARY KEY,
@@ -895,6 +926,12 @@ class JobUpdate(BaseModel):
     tokens_in: Optional[int] = None  # workers SHOULD report token usage on done/failed for cost audit
     tokens_out: Optional[int] = None
     result_mnemos_id: Optional[str] = None  # mem_XXX id where worker stored the outcome — closes provenance loop
+    # F03 (2026-09-14): per-claim fencing token. Workers MUST echo the
+    # `claim_token` they received from the successful claim on every
+    # state-changing call (running/done/failed/cancelled). A stale or missing
+    # token on a terminal write is rejected with 409 — the existing
+    # different-worker rejection guard is preserved on top of this.
+    claim_token: Optional[str] = None
 
 
 class JobRoutingUpdate(BaseModel):
@@ -956,9 +993,15 @@ async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
             orphan_candidates = [(row[0], row[1]) async for row in cur]
         for job_id, claimer in orphan_candidates:
             updated = await db.execute(
+                # F03 (2026-09-14): the reaper also bumps attempt_generation so
+                # any in-flight token the prior claimer is still holding is
+                # GUARANTEED not to match the new generation. The prior
+                # attempt_generation row in job_attempts is closed as 'reaped'
+                # by the mark_attempt_reaped call below for audit.
                 "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                 "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                "claimed_cost_tier=NULL "
+                "claimed_cost_tier=NULL, claim_token=NULL, "
+                "attempt_generation = attempt_generation + 1 "
                 "WHERE id=? AND claimed_by=? AND status IN ('claimed','running') "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM agents WHERE urn=? AND last_heartbeat >= ?"
@@ -976,6 +1019,23 @@ async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
                         "reason": "worker_heartbeat_stale_or_missing",
                     },
                 )
+                # F03 (2026-09-14): close the prior attempt row as 'reaped' so
+                # a stale completion landing after the reap cannot accidentally
+                # stamp a terminal outcome on a still-in_flight attempt. Best-
+                # effort: if this audit write fails, the reap itself succeeded
+                # (job is queued with a fresh generation), so don't 500.
+                try:
+                    await _REPO.mark_attempt_reaped(
+                        job_id=job_id,
+                        prior_claimer=claimer,
+                        reason="worker_heartbeat_stale_or_missing",
+                        now=now,
+                    )
+                except Exception as reap_audit_exc:
+                    print(
+                        f"F03 reap-audit stamp failed for job={job_id}: {reap_audit_exc}",
+                        flush=True,
+                    )
         await db.commit()
     return offline_count, requeued_count
 
@@ -1099,6 +1159,9 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
             "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2",
+            # F03 (2026-09-14): per-claim fencing token + attempt generation.
+            "ALTER TABLE jobs ADD COLUMN claim_token TEXT",
+            "ALTER TABLE jobs ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0",
         )
         for stmt in migrations:
             try:
@@ -1731,8 +1794,11 @@ async def dequeue_next_job(request: Request, agent_urn: str | None = None):
                     "model": agent["agent_model"],
                     "provider": agent["agent_provider"],
                     "cost_tier": agent["agent_tier"],
+                    "attempt_generation": claimed.get("attempt_generation"),
                 },
             )
+        # F03 (2026-09-14): claimed dict already carries the freshly minted
+        # claim_token (set atomically inside _find_and_claim_job_sync).
         return claimed
     return JSONResponse(status_code=204, content=None)
 
@@ -1742,13 +1808,26 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as state_db:
         async with state_db.execute(
-            "SELECT status, claimed_by, max_cost_tier, routing_metadata, submitter_urn FROM jobs WHERE id=?",
+            # F03 (2026-09-14): pull the current claim_token + attempt_generation
+            # so the same-worker-different-attempt stale-completion case can be
+            # rejected at the CAS boundary. The existing different-worker guard
+            # below (claimed_by != caller) is preserved on top of this.
+            "SELECT status, claimed_by, max_cost_tier, routing_metadata, submitter_urn, "
+            "claim_token, attempt_generation FROM jobs WHERE id=?",
             (job_id,),
         ) as state_cur:
             state_row = await state_cur.fetchone()
     if not state_row:
         raise HTTPException(404, f"job not found: {job_id}")
-    current_status, current_claimer, current_cap, routing_metadata_json, submitter_urn = state_row
+    (
+        current_status,
+        current_claimer,
+        current_cap,
+        routing_metadata_json,
+        submitter_urn,
+        current_claim_token,
+        current_attempt_generation,
+    ) = state_row
     caller = _require_agent(request, req.claimed_by)
     allowed_transitions = {
         # Claiming is exclusively handled by the eligibility-checked CAS routes.
@@ -1767,9 +1846,10 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
             raise HTTPException(403, "job is owned by a different worker")
     elif caller != submitter_urn:
         raise HTTPException(403, "only the submitter may mutate an unclaimed job")
-    if current_status in {"done", "failed", "cancelled"} and req.status == current_status:
-        return {"ok": True, "duplicate": True, "ts": now}
-
+    # Validate terminal-result schema FIRST so a malformed request (missing
+    # provider_used/model_used, or KNEMON-decision mismatch) is reported with
+    # 422/409 before any F03 fencing-token check — a malformed request should
+    # not look like a stale-claim_token attack.
     reported_provider = None
     reported_model = None
     reported_tier = None
@@ -1808,6 +1888,7 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
                 tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out,
                 result_mnemos_id=req.result_mnemos_id,
+                claim_token=req.claim_token,
             )
     # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2 (per review 2026-05-23)
     halluc_reason = None
@@ -1826,7 +1907,26 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
                 tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out,
                 result_mnemos_id=req.result_mnemos_id,
+                claim_token=req.claim_token,
             )
+    # F03 (2026-09-14): fencing-token enforcement. A state-changing call on
+    # a currently-claimed job MUST echo the current claim_token — otherwise
+    # it is a stale token from a prior (reaped/reclaimed) attempt. We
+    # enforce this for any write that targets a claimed/running job,
+    # including the running transition, done/failed/cancelled, etc. We do
+    # NOT require the token for writes the SUBMITTER makes against an
+    # unclaimed job (queued/offered -> cancelled) — those never carry a
+    # claim_token because no claim ever happened.
+    if current_claimer and current_claim_token is not None:
+        if not req.claim_token or req.claim_token != current_claim_token:
+            raise HTTPException(
+                409,
+                "stale claim_token: this job's current attempt has a different "
+                "claim_token (reaped + re-claimed or requeued; you are holding "
+                "a token from a prior attempt)",
+            )
+    if current_status in {"done", "failed", "cancelled"} and req.status == current_status:
+        return {"ok": True, "duplicate": True, "ts": now}
     fields = ["status=?"]
     args: list = [req.status]
     if req.status == "queued":
@@ -1876,6 +1976,14 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
     if current_claimer:
         ownership_guard = " AND claimed_by=?"
         args.append(caller)
+        # F03 (2026-09-14): also constrain the UPDATE by the current claim_token
+        # so a stale token from a prior attempt cannot satisfy the WHERE clause.
+        # The early-return 409 above catches the obvious cases, but a concurrent
+        # re-claim that lands between the SELECT and this UPDATE is the
+        # remaining race — the WHERE constraint closes it.
+        if current_claim_token is not None:
+            ownership_guard += " AND claim_token=?"
+            args.append(current_claim_token)
     sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status=?{ownership_guard}"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)
@@ -1883,8 +1991,48 @@ async def update_job(job_id: str, req: JobUpdate, request: Request):
             async with db.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)) as exists_cur:
                 exists = await exists_cur.fetchone()
             if exists:
-                raise HTTPException(409, "job ownership or state changed before update")
+                raise HTTPException(
+                    409,
+                    "job ownership, state, or claim_token changed before update "
+                    "(stale token or concurrent re-claim)",
+                )
             raise HTTPException(404, f"job not found: {job_id}")
+        # F03 (2026-09-14): stamp the terminal outcome on the in_flight attempt
+        # record so the audit log closes for this attempt. Inline in the same
+        # transaction so we do not depend on a cross-connection sqlite3 lock
+        # (which can deadlock under WAL when the reaper_task is concurrently
+        # touching the same DB). We stamp BEFORE emitting job.{status} so the
+        # audit row is consistent with the event.
+        if req.status in ("done", "failed", "cancelled") and current_attempt_generation is not None:
+            outcome_norm = (
+                "completed"
+                if req.status == "done"
+                else "failed"
+                if req.status == "failed"
+                else "cancelled"
+            )
+            try:
+                result_json = (
+                    json.dumps(req.result, separators=(",", ":"), default=str)
+                    if req.result is not None
+                    else None
+                )
+                await db.execute(
+                    "UPDATE job_attempts SET outcome=?, outcome_at=?, result=? "
+                    "WHERE job_id=? AND attempt_generation=? AND outcome='in_flight'",
+                    (
+                        outcome_norm,
+                        float(now),
+                        result_json,
+                        job_id,
+                        int(current_attempt_generation),
+                    ),
+                )
+            except Exception as audit_exc:
+                # Audit failure must not block the terminal write — the
+                # job-state update already committed and the worker needs its
+                # ack. Surface the failure to logs but do not 500.
+                print(f"F03 attempt-audit stamp failed for job={job_id}: {audit_exc}", flush=True)
         # Roll MTD spend onto claimer (subscription throttle requires this)
         if cost_estimate and cost_estimate > 0 and claimed_by_urn:
             await db.execute(
@@ -2344,9 +2492,18 @@ async def claim_job(job_id: str, request: Request, by: str | None = None):
                 "model": agent["agent_model"],
                 "provider": agent["agent_provider"],
                 "cost_tier": agent["agent_tier"],
+                "attempt_generation": claimed.get("attempt_generation"),
             },
         )
-    return {"claimed": True, "ts": now}
+    # F03 (2026-09-14): hand the freshly minted claim_token back to the
+    # caller. Every subsequent state-changing call from this attempt MUST
+    # echo this token; otherwise it is rejected with 409 stale-claim_token.
+    return {
+        "claimed": True,
+        "ts": now,
+        "claim_token": claimed.get("claim_token"),
+        "attempt_generation": claimed.get("attempt_generation"),
+    }
 
 
 @app.get("/v1/jobs")
@@ -2376,7 +2533,7 @@ async def list_jobs(
         "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, "
         "started_at, ended_at, result, required_capabilities, eligible_kinds, max_cost_tier, "
         "preferred_providers, preferred_models, mnemos_refs, depends_on, routed_at, routing_metadata, "
-        "retry_backoff_until "
+        "retry_backoff_until, claim_token, attempt_generation "
         "FROM jobs WHERE 1=1"
     )
     args: list = []
@@ -2426,6 +2583,11 @@ async def list_jobs(
                         "depends_on": json.loads(r[17]) if r[17] else None,
                         "routed_at": r[18],
                         "routing_metadata": json.loads(r[19]) if r[19] else None,
+                        # F03 (2026-09-14): expose claim_token + attempt_generation
+                        # so workers can recover their current fencing token via
+                        # GET /v1/jobs and admins can audit attempt history.
+                        "claim_token": r[21],
+                        "attempt_generation": r[22],
                     }
                 )
                 if len(rows) >= _bounded_result_limit(limit):

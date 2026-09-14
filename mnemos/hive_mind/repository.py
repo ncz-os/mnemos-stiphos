@@ -103,7 +103,8 @@ _SERVICE_JOB_SELECT_COLUMNS = (
     "claimed_runtime, claimed_model, claimed_provider, "
     "claimed_cost_tier, started_at, retry_backoff_until, ended_at, "
     "result, result_mnemos_id, tokens_in, tokens_out, "
-    "estimated_cost_usd, retry_count, max_retries, routing_metadata"
+    "estimated_cost_usd, retry_count, max_retries, routing_metadata, "
+    "claim_token, attempt_generation"
 )
 
 _SERVICE_JOB_CANDIDATE_COLUMNS = (
@@ -273,12 +274,42 @@ class SqliteHiveMindRepository:
                   tokens_out INTEGER,
                   estimated_cost_usd REAL,
                   retry_count INTEGER NOT NULL DEFAULT 0,
-                  max_retries INTEGER NOT NULL DEFAULT 2
+                  max_retries INTEGER NOT NULL DEFAULT 2,
+                  -- F03 (2026-09-14): per-claim fencing token + attempt generation.
+                  -- A successful claim mints a fresh UUID token AND bumps attempt_generation
+                  -- atomically; the SAME agent (or any other) cannot complete a later claim
+                  -- with the stale token from a previous attempt. Reaper -> requeue resets
+                  -- attempt_generation to a new value (the new claim bumps it again).
+                  claim_token TEXT,
+                  attempt_generation INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_queue
                   ON jobs(status, priority DESC, started_at ASC);
                 CREATE INDEX IF NOT EXISTS idx_jobs_costs
                   ON jobs(ended_at, claimed_provider, claimed_model);
+                -- Immutable per-claim audit record. One row per claim attempt (including
+                -- reaped/requeued/cancelled attempts), so a stale completion can be
+                -- diagnosed after the fact, not just rejected at the CAS boundary.
+                -- F03 (2026-09-14).
+                CREATE TABLE IF NOT EXISTS job_attempts (
+                  attempt_id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL,
+                  attempt_generation INTEGER NOT NULL,
+                  claim_token TEXT NOT NULL,
+                  claimed_by TEXT,
+                  claimed_at REAL,
+                  outcome TEXT NOT NULL DEFAULT 'in_flight'
+                    CHECK(outcome IN ('in_flight','completed','failed','cancelled','reaped')),
+                  outcome_at REAL,
+                  result TEXT,
+                  released_by TEXT,
+                  released_at REAL,
+                  release_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id
+                  ON job_attempts(job_id, attempt_generation);
+                CREATE INDEX IF NOT EXISTS idx_job_attempts_outcome
+                  ON job_attempts(outcome);
                 CREATE TABLE IF NOT EXISTS worker_kind_stats (
                   urn TEXT NOT NULL,
                   kind TEXT NOT NULL,
@@ -807,7 +838,8 @@ class SqliteHiveMindRepository:
                         cur = db.execute(
                             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                             "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
-                            "claimed_cost_tier=? "
+                            "claimed_cost_tier=?, claim_token=?, "
+                            "attempt_generation = attempt_generation + 1 "
                             "WHERE id=? AND status='queued' AND claimed_by IS NULL",
                             (
                                 agent_urn,
@@ -816,6 +848,7 @@ class SqliteHiveMindRepository:
                                 agent_model,
                                 agent_provider,
                                 agent_tier,
+                                _uuid7(),
                                 candidate[0],
                             ),
                         )
@@ -826,6 +859,23 @@ class SqliteHiveMindRepository:
                             f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} FROM jobs WHERE id=?",
                             (candidate[0],),
                         ).fetchone()
+                        # F03 (2026-09-14): persist the immutable attempt record so
+                        # a stale completion from a future reaped/reclaimed attempt
+                        # can be diagnosed after the fact, not just rejected.
+                        db.execute(
+                            "INSERT INTO job_attempts "
+                            "(attempt_id, job_id, attempt_generation, claim_token, "
+                            "claimed_by, claimed_at, outcome) "
+                            "VALUES (?, ?, ?, ?, ?, ?, 'in_flight')",
+                            (
+                                _uuid7(),
+                                claimed_row[0],
+                                int(claimed_row[34]),
+                                claimed_row[33],
+                                claimed_row[16],
+                                float(claimed_row[17] or now),
+                            ),
+                        )
                         db.commit()
                         claimed = self._service_job_from_row(claimed_row)
                         claimed["claimed_resources"] = {
@@ -921,7 +971,8 @@ class SqliteHiveMindRepository:
                 cur = db.execute(
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
-                    "claimed_cost_tier=? "
+                    "claimed_cost_tier=?, claim_token=?, "
+                    "attempt_generation = attempt_generation + 1 "
                     "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL",
                     (
                         agent_urn,
@@ -930,21 +981,38 @@ class SqliteHiveMindRepository:
                         agent_model,
                         agent_provider,
                         agent_tier,
+                        _uuid7(),
                         job_id,
                     ),
                 )
                 if cur.rowcount != 1:
                     db.rollback()
                     return ("unavailable", None)
+                # Re-read the row so we pick up the freshly minted claim_token
+                # and bumped attempt_generation from the UPDATE above.
+                fresh_row = db.execute(
+                    f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                claimed_row = list(fresh_row)
+                # F03 (2026-09-14): persist the immutable attempt record so a
+                # stale completion from a future reaped/reclaimed attempt can be
+                # diagnosed after the fact, not just rejected at the CAS layer.
+                db.execute(
+                    "INSERT INTO job_attempts "
+                    "(attempt_id, job_id, attempt_generation, claim_token, "
+                    "claimed_by, claimed_at, outcome) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'in_flight')",
+                    (
+                        _uuid7(),
+                        job_id,
+                        int(claimed_row[34]),
+                        claimed_row[33],
+                        claimed_row[16],
+                        float(claimed_row[17] or now),
+                    ),
+                )
                 db.commit()
-                claimed_row = list(row)
-                claimed_row[15] = "claimed"
-                claimed_row[16] = agent_urn
-                claimed_row[17] = now
-                claimed_row[18] = agent_runtime
-                claimed_row[19] = agent_model
-                claimed_row[20] = agent_provider
-                claimed_row[21] = agent_tier
                 claimed = self._service_job_from_row(claimed_row)
                 claimed["claimed_resources"] = {
                     "runtime": agent_runtime,
@@ -1222,6 +1290,13 @@ class SqliteHiveMindRepository:
             "retry_count": row[30],
             "max_retries": row[31],
             "routing_metadata": cls._loads(row[32], {}),
+            # F03 (2026-09-14): every successful claim mints a fresh claim_token
+            # and bumps attempt_generation. Workers MUST send this token back on
+            # every state-changing call (running/done/failed/cancelled) for the
+            # life of the attempt; stale tokens from a prior/reaped attempt are
+            # rejected at the CAS boundary. See job_attempts table for audit.
+            "claim_token": row[33],
+            "attempt_generation": row[34],
         }
 
     async def emit_event(
@@ -1244,6 +1319,143 @@ class SqliteHiveMindRepository:
                 ),
             )
             db.commit()
+
+    # ------------------------------------------------------------------
+    # F03 (2026-09-14) attempt-fencing helpers
+    # ------------------------------------------------------------------
+    async def mark_attempt_outcome(
+        self,
+        *,
+        job_id: str,
+        attempt_generation: int,
+        outcome: str,
+        outcome_at: float,
+        result: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Stamp a terminal outcome onto the in_flight attempt record for
+        (job_id, attempt_generation). Returns True iff exactly one row was
+        updated (the row must still be 'in_flight'). Callers MUST pass
+        attempt_generation as observed alongside the matching claim_token —
+        a stale attempt_generation (e.g. from a reaped attempt) is silently
+        ignored, which is correct: a reaped attempt is already closed.
+        """
+        outcome_norm = str(outcome).lower()
+        if outcome_norm not in {"completed", "failed", "cancelled", "reaped"}:
+            raise ValueError(f"unsupported attempt outcome: {outcome!r}")
+        return await asyncio.to_thread(
+            self._mark_attempt_outcome_sync,
+            job_id=job_id,
+            attempt_generation=int(attempt_generation),
+            outcome=outcome_norm,
+            outcome_at=float(outcome_at),
+            result=result,
+        )
+
+    def _mark_attempt_outcome_sync(
+        self,
+        *,
+        job_id: str,
+        attempt_generation: int,
+        outcome: str,
+        outcome_at: float,
+        result: Optional[dict[str, Any]],
+    ) -> bool:
+        result_json = (
+            json.dumps(result, separators=(",", ":"), default=str)
+            if result is not None
+            else None
+        )
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            cur = db.execute(
+                "UPDATE job_attempts SET outcome=?, outcome_at=?, result=? "
+                "WHERE job_id=? AND attempt_generation=? AND outcome='in_flight'",
+                (outcome, float(outcome_at), result_json, job_id, int(attempt_generation)),
+            )
+            db.commit()
+            return cur.rowcount == 1
+
+    async def mark_attempt_reaped(
+        self,
+        *,
+        job_id: str,
+        prior_claimer: str,
+        reason: str,
+        now: float,
+    ) -> bool:
+        """Close the in_flight attempt for (job_id, current claimed_by=prior_claimer)
+        as 'reaped'. Used by the service reaper path. The next successful claim
+        mints a new token + bumps attempt_generation; the prior attempt stays
+        auditable in the job_attempts log with outcome='reaped'."""
+        return await asyncio.to_thread(
+            self._mark_attempt_reaped_sync,
+            job_id=job_id,
+            prior_claimer=prior_claimer,
+            reason=reason,
+            now=float(now),
+        )
+
+    def _mark_attempt_reaped_sync(
+        self,
+        *,
+        job_id: str,
+        prior_claimer: str,
+        reason: str,
+        now: float,
+    ) -> bool:
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            cur = db.execute(
+                "UPDATE job_attempts SET outcome='reaped', outcome_at=?, "
+                "released_by=?, released_at=?, release_reason=? "
+                "WHERE job_id=? AND claimed_by=? AND outcome='in_flight'",
+                (
+                    float(now),
+                    prior_claimer,
+                    float(now),
+                    reason,
+                    job_id,
+                    prior_claimer,
+                ),
+            )
+            db.commit()
+            return cur.rowcount >= 1
+
+    async def fetch_attempt_audit(
+        self,
+        *,
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the immutable attempt history for a job, ordered by generation."""
+        return await asyncio.to_thread(self._fetch_attempt_audit_sync, job_id=job_id)
+
+    def _fetch_attempt_audit_sync(self, *, job_id: str) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as db:
+            rows = db.execute(
+                "SELECT attempt_id, job_id, attempt_generation, claim_token, "
+                "claimed_by, claimed_at, outcome, outcome_at, result, "
+                "released_by, released_at, release_reason "
+                "FROM job_attempts WHERE job_id=? "
+                "ORDER BY attempt_generation ASC",
+                (job_id,),
+            ).fetchall()
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            history.append(
+                {
+                    "attempt_id": row[0],
+                    "job_id": row[1],
+                    "attempt_generation": row[2],
+                    "claim_token": row[3],
+                    "claimed_by": row[4],
+                    "claimed_at": row[5],
+                    "outcome": row[6],
+                    "outcome_at": row[7],
+                    "result": self._loads(row[8], None),
+                    "released_by": row[9],
+                    "released_at": row[10],
+                    "release_reason": row[11],
+                }
+            )
+        return history
 
     async def cache_get(self, cache_key: str) -> Optional[dict[str, Any]]:
         with sqlite3.connect(self.db_path) as db:

@@ -16,3 +16,7 @@ venv/
 # zoder task framework scratch file (F02 2026-09-14): kept untracked at the
 # repo root, but should not appear in --scope working-tree reviews.
 .zoder_task_*.md
+# Scratch task description / run log dropped at repo root by the prior
+# fix attempts (F03 2026-09-14). Same rationale as the zoder scratch file.
+TASK_F*.md
+zoder_run.log

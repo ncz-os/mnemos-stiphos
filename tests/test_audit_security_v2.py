@@ -241,17 +241,21 @@ def test_terminal_retry_is_idempotent_and_does_not_repeat_side_effects(
             required_capabilities=["code"],
             eligible_kinds=["zeroclaw"],
         )
-        assert (
-            client.post(
-                f"/v1/jobs/{job_id}/claim",
-                headers=_auth(worker["agent_token"]),
-                params={"by": worker["urn"]},
-            ).status_code
-            == 200
+        claim_resp = client.post(
+            f"/v1/jobs/{job_id}/claim",
+            headers=_auth(worker["agent_token"]),
+            params={"by": worker["urn"]},
         )
+        assert claim_resp.status_code == 200, claim_resp.text
+        # F03 (2026-09-14): the /v1/jobs/{job_id}/claim response now carries
+        # the freshly minted claim_token. Echo it on every state-changing
+        # call (including the idempotent duplicate replay) so the server's
+        # fencing check accepts the write.
+        claim_token = claim_resp.json().get("claim_token")
         payload = {
             "status": "done",
             "claimed_by": worker["urn"],
+            "claim_token": claim_token,
             "tokens_in": 100,
             "tokens_out": 50,
             "result": {"exit_code": 0, "provider_used": "ngc", "model_used": "test"},
