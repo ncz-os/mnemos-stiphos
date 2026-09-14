@@ -37,14 +37,25 @@ def test_bus_rejects_missing_or_invalid_bearer_token(monkeypatch, tmp_path) -> N
     monkeypatch.setenv("HIVE_BUS_TOKEN", "correct-token")
 
     with _client(monkeypatch, tmp_path) as client:
+        # Bootstrap is registration-only (F02 2026-09-14); register an agent
+        # so we have a real agent_token to drive the "valid bearer" path.
+        registered = client.post(
+            "/v1/agents/register",
+            headers={"authorization": "Bearer correct-token"},
+            json={"runtime": "claude-code", "host": "auth-test"},
+        )
+        assert registered.status_code == 200, registered.text
+        agent_token = registered.json()["agent_token"]
+
         missing = client.get("/v1/agents")
         invalid = client.get("/v1/agents", headers={"authorization": "Bearer wrong-token"})
-        valid = client.get("/v1/agents", headers={"authorization": "Bearer correct-token"})
+        valid = client.get("/v1/agents", headers={"authorization": f"Bearer {agent_token}"})
 
     assert missing.status_code == 401
     assert invalid.status_code == 401
     assert valid.status_code == 200
-    assert valid.json() == {"count": 0, "agents": []}
+    assert valid.json()["count"] == 1
+    assert {agent["urn"] for agent in valid.json()["agents"]} == {registered.json()["urn"]}
 
 
 def test_bus_accepts_namespaced_token_env(monkeypatch, tmp_path) -> None:
@@ -52,7 +63,18 @@ def test_bus_accepts_namespaced_token_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MNEMOS_HIVE_BUS_TOKEN", "namespaced-token")
 
     with _client(monkeypatch, tmp_path) as client:
-        response = client.get("/v1/agents", headers={"authorization": "Bearer namespaced-token"})
+        # Bootstrap is registration-only (F02 2026-09-14); the bus token
+        # mints a real agent identity, and that agent_token is the proper
+        # bearer for fleet reads.
+        registered = client.post(
+            "/v1/agents/register",
+            headers={"authorization": "Bearer namespaced-token"},
+            json={"runtime": "claude-code", "host": "auth-test"},
+        )
+        assert registered.status_code == 200, registered.text
+        agent_token = registered.json()["agent_token"]
+
+        response = client.get("/v1/agents", headers={"authorization": f"Bearer {agent_token}"})
 
     assert response.status_code == 200
 

@@ -35,6 +35,12 @@ HIVE_ADMIN_TOKEN_ENV_NAMES = ("HIVE_ADMIN_TOKEN", "MNEMOS_HIVE_ADMIN_TOKEN")
 HIVE_BUS_AUTH_REQUIRED_ENV_NAMES = ("HIVE_BUS_AUTH_REQUIRED", "MNEMOS_HIVE_BUS_AUTH_REQUIRED")
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 _PUBLIC_PATHS = {"/health", "", "/dashboard.js"}  # dashboard assets collect the API token in-browser
+# F02 (2026-09-14): bootstrap credentials are registration-only. They may only
+# be used to mint a new agent/worker identity via POST /v1/agents/register.
+# Anything else (reading events/messages/jobs, hitting SSE, mutating jobs,
+# publishing messages, MCP, ...) is forbidden — an authenticated worker with a
+# proper agent_token never needs the bootstrap credential for any of those.
+_BOOTSTRAP_ALLOWED_PATHS = frozenset({"/v1/agents/register"})
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -722,6 +728,99 @@ async def _job_is_visible_claim_candidate(row: tuple, agent: dict, now: float) -
     return not required_pools or bool(required_pools.intersection(agent_pools))
 
 
+# F02 (2026-09-14): event history, SSE live delivery, and directed messages were
+# all read with no audience check, while /v1/jobs already filtered by submitter,
+# claimer, or claim-eligibility. That let any authenticated worker (and the
+# bootstrap token) recover the description/id/mnemos_refs of jobs they had no
+# right to see. The single shared audience predicate below is the fix and is
+# used by /v1/events/log, /v1/events (SSE), and /v1/messages. /v1/jobs keeps
+# its original inline filter (do NOT weaken the reference implementation while
+# extracting this helper).
+_JOB_AUDIENCE_KINDS_PREFIX = "job."
+
+
+async def _job_row_visible_to_agent(
+    job_id: str, agent_urn: str | None, agent_ctx: dict | None, now: float
+) -> bool:
+    """Mirror /v1/jobs visibility: a job is visible to an agent iff the agent
+    is the submitter, the claimer, or eligible to claim it while it is queued
+    or offered and unowned. Returns False for unknown ids. Returns True for
+    admin-equivalent callers (agent_ctx is None AND agent_urn is None) so
+    internal callers with no per-agent identity see everything.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, "
+            "status, claimed_by, started_at, ended_at, result, required_capabilities, "
+            "eligible_kinds, max_cost_tier, preferred_providers, preferred_models, "
+            "mnemos_refs, depends_on, routed_at, routing_metadata, retry_backoff_until "
+            "FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if row is None:
+        return False
+    submitter_urn = row[1]
+    claimed_by = row[7]
+    status = row[6]
+    if agent_urn and (submitter_urn == agent_urn or claimed_by == agent_urn):
+        return True
+    if status in ("queued", "offered") and claimed_by is None:
+        if agent_urn is None and agent_ctx is None:
+            return True  # no per-agent identity attached — admin/internal
+        if agent_ctx is None:
+            return False
+        return await _job_is_visible_claim_candidate(row, agent_ctx, now)
+    return False
+
+
+async def _event_visible_to_agent(
+    event: dict, agent_urn: str | None, agent_ctx: dict | None, now: float
+) -> bool:
+    """Audience predicate for events emitted on the bus. Job lifecycle events
+    ride on the referenced job's visibility (same rule as /v1/jobs). Message
+    events are visible to the recipient, the sender, or the whole fleet when
+    broadcast (to_urn is null). Other events (agent.*, schedule.*, heartbeat)
+    are visible if addressed to the caller or broadcast.
+    """
+    if agent_urn is None and agent_ctx is None:
+        return True  # no per-agent identity — admin/internal caller
+    kind = (event.get("kind") or "").strip()
+    payload = event.get("payload") or {}
+    if kind.startswith(_JOB_AUDIENCE_KINDS_PREFIX) or kind == "job":
+        job_id = payload.get("id")
+        if not job_id:
+            # Malformed event: we cannot verify audience, so deny rather than
+            # fail open. A job.* event without an id is broken at the source.
+            return False
+        return await _job_row_visible_to_agent(job_id, agent_urn, agent_ctx, now)
+    if kind == "message":
+        to_urn = payload.get("to")
+        from_urn = payload.get("from")
+        # A direct message MUST have a recipient. A message without `to`
+        # is a broadcast (visible to every authenticated agent) provided it
+        # has a sender — that is the only valid shape that the publish
+        # endpoint emits. A malformed message with neither `to` nor `from`
+        # is denied: we cannot verify audience, so fail closed.
+        if to_urn is None:
+            return from_urn is not None
+        if not agent_urn:
+            return False
+        return to_urn == agent_urn or from_urn == agent_urn
+    # Other event kinds (agent.online / agent.offline, schedule.fired, …) are
+    # addressed to a specific agent: visible to that agent, hidden from others.
+    # Unaddressed events (no urn anywhere) are broadcast — they are fleet-wide
+    # notices by convention (e.g. "schedule.fired" is operational metadata,
+    # not private content). Admin/internal callers are handled by the
+    # short-circuit at the top of this function.
+    target = event.get("agent_urn") or payload.get("urn")
+    if target is None:
+        return True
+    if agent_urn and target == agent_urn:
+        return True
+    return False
+
+
 class AgentRegister(BaseModel):
     # OPEN REGISTRATION + RUNTIME→KIND ENFORCEMENT (per Kimi advisory 2026-05-23).
     # Any agent registers; identity is recorded for transparency. Kind must align
@@ -1078,6 +1177,14 @@ async def require_hive_bus_bearer(request: Request, call_next):
         "admin",
     }:
         return JSONResponse(status_code=403, content={"detail": "fleet bootstrap credential required"})
+    if (
+        _request_role(request) == "bootstrap"
+        and request.url.path.rstrip("/") not in _BOOTSTRAP_ALLOWED_PATHS
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "bootstrap credential is registration-only"},
+        )
     return await call_next(request)
 
 
@@ -2352,14 +2459,57 @@ async def publish_message(req: MessagePublish, request: Request):
 
 @app.get("/v1/messages")
 async def list_messages(
+    request: Request = None,
     to_urn: Optional[str] = None,
     topic: Optional[str] = None,
     since: Optional[float] = None,
     limit: int = 100,
 ):
+    """Read directed messages. Audience-scoped to the caller: an agent sees
+    messages it sent, messages addressed to it, and broadcast messages
+    (to_urn IS NULL). The to_urn query parameter, if supplied, must match the
+    caller (admins may pass any to_urn). Bootstrap credentials cannot read
+    (registration-only scope; F02 2026-09-14).
+
+    `request` is optional so that internal callers (e.g. perf-clamp unit
+    tests) can invoke this function directly without going through FastAPI's
+    dependency injection. When None, the caller is treated as the
+    admin-equivalent unfiltered path — same convention as `events_log`.
+    """
+    if request is None:
+        request = Request({"type": "http", "method": "GET", "path": "/internal", "headers": []})
+        request.state.hive_auth_role = "disabled"
+    role = _request_role(request)
+    caller_urn: str | None = None
+    if role == "bootstrap":
+        raise HTTPException(403, "bootstrap credential cannot read messages")
+    if role == "agent":
+        caller_urn = getattr(request.state, "agent_urn", None)
+        if not caller_urn:
+            raise HTTPException(403, "per-agent credential is not bound to an agent")
+        if to_urn and to_urn != caller_urn:
+            raise HTTPException(403, "agents may only read messages addressed to themselves")
+    elif role == "disabled":
+        if not to_urn:
+            # Internal direct call (no FastAPI caller): preserve the
+            # pre-fix behaviour for perf-clamp callers, who pass no to_urn
+            # and expect a count of every message.
+            pass
+        else:
+            caller_urn = to_urn
+    elif role != "admin":
+        raise HTTPException(403, "per-agent or admin credential required")
+
     sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts FROM messages WHERE 1=1"
     args: list = []
-    if to_urn:
+    if role == "agent":
+        sql += " AND (to_urn=? OR to_urn IS NULL OR from_urn=?)"
+        args.extend([caller_urn, caller_urn])
+    elif role == "disabled" and caller_urn is not None:
+        # HTTP-disabled caller supplied to_urn — scope to that agent.
+        sql += " AND (to_urn=? OR to_urn IS NULL OR from_urn=?)"
+        args.extend([caller_urn, caller_urn])
+    elif to_urn:
         sql += " AND (to_urn=? OR to_urn IS NULL)"
         args.append(to_urn)
     if topic:
@@ -2390,7 +2540,24 @@ async def list_messages(
 
 @app.get("/v1/events")
 async def stream_events(request: Request, since_id: Optional[int] = None):
-    """SSE stream of events. Optional since_id for catch-up."""
+    """SSE stream of events. Optional since_id for catch-up. Audience-scoped
+    to the calling agent using the same predicate /v1/jobs uses for job
+    visibility (F02 2026-09-14). Bootstrap credentials cannot subscribe
+    (registration-only scope).
+    """
+    role = _request_role(request)
+    caller_urn: str | None = None
+    caller_ctx: dict | None = None
+    if role == "bootstrap":
+        raise HTTPException(403, "bootstrap credential cannot subscribe to live events")
+    if role == "agent":
+        caller_urn = getattr(request.state, "agent_urn", None)
+        if not caller_urn:
+            raise HTTPException(403, "per-agent credential is not bound to an agent")
+        caller_ctx = await _claim_agent_context(caller_urn)
+    elif role not in {"admin", "disabled"}:
+        raise HTTPException(403, "per-agent or admin credential required")
+
     sub_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_EVENT_QUEUE_SIZE)
     EVENT_QUEUE[sub_id] = queue
@@ -2415,10 +2582,18 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                         if not batch:
                             break
                         for r in batch:
+                            evt = {
+                                "id": r[0],
+                                "ts": r[1],
+                                "kind": r[2],
+                                "payload": json.loads(r[3]),
+                            }
+                            if not await _event_visible_to_agent(evt, caller_urn, caller_ctx, time.time()):
+                                continue
                             yield {
-                                "id": str(r[0]),
-                                "event": r[2],
-                                "data": json.dumps({"ts": r[1], "kind": r[2], "payload": json.loads(r[3])}),
+                                "id": str(evt["id"]),
+                                "event": evt["kind"],
+                                "data": json.dumps({"ts": evt["ts"], "kind": evt["kind"], "payload": evt["payload"]}),
                             }
                         catchup_cursor = int(batch[-1][0])
             # live stream
@@ -2428,6 +2603,8 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                     break
                 try:
                     evt = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
+                    if not await _event_visible_to_agent(evt, caller_urn, caller_ctx, time.time()):
+                        continue
                     yield {
                         "event": evt["kind"],
                         "data": json.dumps(evt),
@@ -2439,12 +2616,47 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
         finally:
             EVENT_QUEUE.pop(sub_id, None)
 
-    return EventSourceResponse(gen())
+    # Use the same ping interval for the sse_starlette keep-alive task as
+    # the inline generator's queue.get() timeout — both honour the
+    # SSE_PING_INTERVAL module constant so tests can shrink it without
+    # waiting 15s for keep-alives.
+    return EventSourceResponse(gen(), ping=SSE_PING_INTERVAL)
 
 
 @app.get("/v1/events/log")
-async def events_log(since_id: Optional[int] = None, limit: int = 100):
-    """JSON polling alternative to SSE."""
+async def events_log(
+    request: Request = None,
+    since_id: Optional[int] = None,
+    limit: int = 100,
+):
+    """JSON polling alternative to SSE. Audience-scoped: the same predicate
+    /v1/jobs uses for job visibility also gates which events a caller can read
+    (job lifecycle events ride on their referenced job; message events ride on
+    the message's from/to; others ride on agent_urn). Bootstrap credentials
+    cannot read this surface (registration-only scope; F02 2026-09-14).
+
+    `request` is optional so that internal callers (e.g. perf-clamp unit
+    tests) can invoke this function directly without going through FastAPI's
+    dependency injection. When None, the caller is treated as the
+    admin-equivalent unfiltered path (same as `_job_row_visible_to_agent`
+    when both `agent_urn` and `agent_ctx` are None).
+    """
+    if request is None:
+        request = Request({"type": "http", "method": "GET", "path": "/internal", "headers": []})
+        request.state.hive_auth_role = "disabled"
+    role = _request_role(request)
+    caller_urn: str | None = None
+    caller_ctx: dict | None = None
+    if role == "bootstrap":
+        raise HTTPException(403, "bootstrap credential cannot read event history")
+    if role == "agent":
+        caller_urn = getattr(request.state, "agent_urn", None)
+        if not caller_urn:
+            raise HTTPException(403, "per-agent credential is not bound to an agent")
+        caller_ctx = await _claim_agent_context(caller_urn)
+    elif role not in {"admin", "disabled"}:
+        raise HTTPException(403, "per-agent or admin credential required")
+
     sql = "SELECT id, ts, kind, payload, agent_urn FROM events"
     args: list = []
     if since_id is not None:
@@ -2452,11 +2664,11 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
         args.append(since_id)
     sql += " ORDER BY id ASC LIMIT ?"
     args.append(_bounded_result_limit(limit))
-    rows = []
+    raw_rows = []
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                rows.append(
+                raw_rows.append(
                     {
                         "id": r[0],
                         "ts": r[1],
@@ -2465,7 +2677,24 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
                         "agent_urn": r[4],
                     }
                 )
-    return {"count": len(rows), "events": rows, "last_id": rows[-1]["id"] if rows else since_id}
+    now = time.time()
+    rows = []
+    # last_id is the highest event id the caller has CONSIDERED, not the
+    # highest id they were allowed to see. When every event in the window is
+    # hidden by the audience filter, last_id still advances past them so the
+    # client's next poll (since_id=last_id) makes forward progress instead of
+    # re-querying the same window forever. Match the original contract when
+    # the DB has nothing past since_id: last_id stays at since_id (so the
+    # client knows it is "caught up" — None when no cursor was given).
+    last_id = since_id
+    for ev in raw_rows:
+        ev_id = int(ev["id"])
+        if last_id is None or ev_id > last_id:
+            last_id = ev_id
+        if not await _event_visible_to_agent(ev, caller_urn, caller_ctx, now):
+            continue
+        rows.append(ev)
+    return {"count": len(rows), "events": rows, "last_id": last_id}
 
 
 # ---------- minimal MCP shim ----------
