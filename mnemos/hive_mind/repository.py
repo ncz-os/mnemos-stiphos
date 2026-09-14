@@ -23,6 +23,17 @@ def _uuid7() -> str:
         return str(uuid.UUID(int=value))
 
 
+def _attempt_lease_seconds() -> float:
+    """STIPHOS heartbeat-lease (2026-09-14): default lease duration in
+    seconds. Mirrors ``service.ATTEMPT_LEASE_SECONDS`` but does not import
+    ``service`` (which would create a circular import) — both paths read
+    the env var independently so they agree."""
+    try:
+        return float(os.environ.get("HIVE_ATTEMPT_LEASE_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+
+
 @runtime_checkable
 class HiveMindRepository(Protocol):
     async def init(self) -> None: ...
@@ -93,6 +104,30 @@ class HiveMindRepository(Protocol):
     async def fetch_jobs_metrics(self) -> dict[str, Any]: ...
     async def fetch_hosts(self) -> list[dict[str, Any]]: ...
     async def fetch_agents_stats(self) -> dict[str, Any]: ...
+    async def mark_attempt_reaped(
+        self,
+        *,
+        job_id: str,
+        prior_claimer: str,
+        reason: str,
+        now: float,
+    ) -> bool: ...
+    async def renew_attempt_lease(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        extension_seconds: float | None = None,
+    ) -> dict[str, Any]: ...
+    async def cancel_attempt(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        reason: str,
+    ) -> dict[str, Any]: ...
 
 
 _SERVICE_JOB_SELECT_COLUMNS = (
@@ -281,7 +316,21 @@ class SqliteHiveMindRepository:
                   -- with the stale token from a previous attempt. Reaper -> requeue resets
                   -- attempt_generation to a new value (the new claim bumps it again).
                   claim_token TEXT,
-                  attempt_generation INTEGER NOT NULL DEFAULT 0
+                  attempt_generation INTEGER NOT NULL DEFAULT 0,
+                  -- STIPHOS heartbeat-lease (2026-09-14): per-attempt progress lease,
+                  -- distinct from the worker's general heartbeat. Set on a successful
+                  -- claim to (now + ATTEMPT_LEASE_SECONDS); renewed by the worker
+                  -- via POST /v1/jobs/{id}/lease/renew with the live claim_token.
+                  -- The reaper treats a lapsed lease as the authoritative reap
+                  -- signal — even if the worker process is still heartbeating
+                  -- normally. A bounded number of lease expiries is allowed
+                  -- before the job is finally marked failed.
+                  attempt_lease_deadline REAL,
+                  attempt_lease_renewed_at REAL,
+                  attempt_lease_renewals INTEGER NOT NULL DEFAULT 0,
+                  attempt_lease_max_renewals INTEGER NOT NULL DEFAULT 0,
+                  attempt_lease_expired_at REAL,
+                  attempt_lease_expiry_count INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_queue
                   ON jobs(status, priority DESC, started_at ASC);
@@ -836,10 +885,21 @@ class SqliteHiveMindRepository:
                             db.rollback()
                             continue
                         cur = db.execute(
+                            # STIPHOS heartbeat-lease (2026-09-14): set
+                            # attempt_lease_deadline = now + lease on every
+                            # successful claim. The lease is per-attempt and
+                            # distinct from the worker's general heartbeat,
+                            # so a hung attempt on a healthy worker is
+                            # detectable. renewed_at is set to now (the
+                            # initial "renewal" at claim time); renewals is
+                            # initialized to 0 and bumps on each explicit
+                            # /v1/jobs/{id}/lease/renew call.
                             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                             "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
                             "claimed_cost_tier=?, claim_token=?, "
-                            "attempt_generation = attempt_generation + 1 "
+                            "attempt_generation = attempt_generation + 1, "
+                            "attempt_lease_deadline=?, attempt_lease_renewed_at=?, "
+                            "attempt_lease_renewals=0 "
                             "WHERE id=? AND status='queued' AND claimed_by IS NULL",
                             (
                                 agent_urn,
@@ -849,6 +909,8 @@ class SqliteHiveMindRepository:
                                 agent_provider,
                                 agent_tier,
                                 _uuid7(),
+                                now + _attempt_lease_seconds(),
+                                now,
                                 candidate[0],
                             ),
                         )
@@ -969,10 +1031,15 @@ class SqliteHiveMindRepository:
                     db.rollback()
                     return ("ineligible", None)
                 cur = db.execute(
+                    # STIPHOS heartbeat-lease (2026-09-14): set
+                    # attempt_lease_deadline on every successful claim
+                    # (mirrors the /v1/jobs/next path).
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
                     "claimed_cost_tier=?, claim_token=?, "
-                    "attempt_generation = attempt_generation + 1 "
+                    "attempt_generation = attempt_generation + 1, "
+                    "attempt_lease_deadline=?, attempt_lease_renewed_at=?, "
+                    "attempt_lease_renewals=0 "
                     "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL",
                     (
                         agent_urn,
@@ -982,6 +1049,8 @@ class SqliteHiveMindRepository:
                         agent_provider,
                         agent_tier,
                         _uuid7(),
+                        now + _attempt_lease_seconds(),
+                        now,
                         job_id,
                     ),
                 )
@@ -1393,6 +1462,163 @@ class SqliteHiveMindRepository:
             reason=reason,
             now=float(now),
         )
+
+    async def renew_attempt_lease(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        extension_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """STIPHOS heartbeat-lease (2026-09-14): explicitly extend the
+        per-attempt lease for a claimed/running job.
+
+        Returns a dict describing the outcome:
+          - ``{"ok": True, "lease_deadline": float, "renewed_at": float,
+               "renewals": int}`` on a successful renewal.
+          - ``{"ok": False, "reason": "stale_claim_token"}`` if the
+            claim_token does not match the live attempt.
+          - ``{"ok": False, "reason": "not_claimable"}`` if the job is not
+            in claimed/running state.
+
+        The renewal is atomic: the UPDATE is constrained by the live
+        claim_token, so a stale (reaped/reclaimed) token cannot extend the
+        lease any more than it could complete the job.
+        """
+        return await asyncio.to_thread(
+            self._renew_attempt_lease_sync,
+            job_id=job_id,
+            claim_token=claim_token,
+            now=float(now),
+            extension_seconds=extension_seconds,
+        )
+
+    def _renew_attempt_lease_sync(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        extension_seconds: float | None,
+    ) -> dict[str, Any]:
+        if extension_seconds is None:
+            extension_seconds = _attempt_lease_seconds()
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            db.execute("PRAGMA busy_timeout=30000")
+            row = db.execute(
+                "SELECT status, claim_token, attempt_lease_renewals, "
+                "attempt_lease_max_renewals, attempt_lease_deadline "
+                "FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "reason": "not_found"}
+            status, current_token, renewals, max_renewals, current_deadline = row
+            if status not in ("claimed", "running"):
+                return {"ok": False, "reason": "not_claimable"}
+            if current_token is None or current_token != claim_token:
+                # Same fencing rule as completion: stale token rejected.
+                return {"ok": False, "reason": "stale_claim_token"}
+            # Optional bounded renewals — if attempt_lease_max_renewals is
+            # set (>0), refuse to renew past the cap. The default cap is
+            # 0 (unbounded) for backwards compatibility with workers that
+            # don't set it; tests and configs that want a hard cap can
+            # set HIVE_ATTEMPT_LEASE_MAX_RENEWALS via the env.
+            if max_renewals and renewals is not None and renewals >= max_renewals:
+                return {"ok": False, "reason": "renewal_cap_reached"}
+            new_deadline = now + float(extension_seconds)
+            cur = db.execute(
+                "UPDATE jobs SET attempt_lease_deadline=?, "
+                "attempt_lease_renewed_at=?, "
+                "attempt_lease_renewals = COALESCE(attempt_lease_renewals, 0) + 1 "
+                "WHERE id=? AND status IN ('claimed','running') "
+                "AND claim_token=?",
+                (new_deadline, now, job_id, claim_token),
+            )
+            db.commit()
+            if cur.rowcount != 1:
+                # Lost the CAS race — token mismatched between SELECT and UPDATE.
+                return {"ok": False, "reason": "stale_claim_token"}
+            return {
+                "ok": True,
+                "lease_deadline": float(new_deadline),
+                "renewed_at": float(now),
+                "renewals": int((renewals or 0) + 1),
+                "previous_deadline": float(current_deadline) if current_deadline is not None else None,
+            }
+
+    async def cancel_attempt(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        reason: str,
+    ) -> dict[str, Any]:
+        """STIPHOS heartbeat-lease cancellation-acknowledgment (2026-09-14):
+        the OWNER of an in-flight attempt can acknowledge cancellation —
+        the worker actively told the hive "I am stopping this attempt, do
+        not count it as a hung-lease reap". This is the cancellation
+        acknowledgment path; it persists the audit record with outcome
+        'cancelled' and requeues the job for a fresh claim, rather than
+        the default path where the worker simply stops responding and the
+        reaper expires the lease.
+
+        Returns ``{"ok": True, "requeued": True}`` on success.
+        Returns ``{"ok": False, "reason": "stale_claim_token"}`` if the
+        token doesn't match the live attempt.
+        """
+        return await asyncio.to_thread(
+            self._cancel_attempt_sync,
+            job_id=job_id,
+            claim_token=claim_token,
+            now=float(now),
+            reason=reason,
+        )
+
+    def _cancel_attempt_sync(
+        self,
+        *,
+        job_id: str,
+        claim_token: str,
+        now: float,
+        reason: str,
+    ) -> dict[str, Any]:
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            db.execute("PRAGMA busy_timeout=30000")
+            row = db.execute(
+                "SELECT claimed_by, status FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "reason": "not_found"}
+            claimed_by, status = row
+            if status not in ("claimed", "running"):
+                return {"ok": False, "reason": "not_claimable"}
+            cur = db.execute(
+                # F03 (2026-09-14): bump attempt_generation so any in-flight
+                # token the worker is still holding is structurally stale.
+                # STIPHOS (2026-09-14): clear the lease so the next claim
+                # gets a fresh lease deadline.
+                "UPDATE jobs SET status='queued', "
+                "claimed_by=NULL, claimed_at=NULL, "
+                "claimed_runtime=NULL, claimed_model=NULL, "
+                "claimed_provider=NULL, claimed_cost_tier=NULL, "
+                "claim_token=NULL, attempt_generation = attempt_generation + 1, "
+                "attempt_lease_deadline=NULL, attempt_lease_renewed_at=NULL "
+                "WHERE id=? AND claim_token=? AND status IN ('claimed','running')",
+                (job_id, claim_token),
+            )
+            if cur.rowcount != 1:
+                return {"ok": False, "reason": "stale_claim_token"}
+            db.execute(
+                "UPDATE job_attempts SET outcome='cancelled', outcome_at=?, "
+                "release_reason=? WHERE job_id=? AND claimed_by=? AND outcome='in_flight'",
+                (float(now), reason, job_id, claimed_by),
+            )
+            db.commit()
+            return {"ok": True, "requeued": True}
 
     def _mark_attempt_reaped_sync(
         self,

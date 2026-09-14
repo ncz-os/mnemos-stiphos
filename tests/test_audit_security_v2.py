@@ -319,6 +319,13 @@ async def test_reaper_uses_heartbeat_freshness_and_atomic_owner_guard(
     await repo.init()
     with sqlite3.connect(db_path) as db:
         db.executescript(service.SCHEMA)
+        # STIPHOS heartbeat-lease (2026-09-14): apply the additive
+        # lease columns that the lifespan migration normally adds.
+        # The test bypasses the FastAPI lifespan and applies SCHEMA
+        # directly, so it must apply the per-attempt-lease columns
+        # explicitly so the reaper's lease-expired query can run without
+        # ``no such column`` errors.
+        service.apply_additive_migrations_sync(db)
         for urn, heartbeat in (("fresh-worker", now), ("stale-worker", now - 120)):
             db.execute(
                 "INSERT INTO agents (urn,kind,host,session_id,started_at,last_heartbeat,status) "

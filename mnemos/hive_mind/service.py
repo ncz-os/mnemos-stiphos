@@ -57,6 +57,24 @@ from mnemos.hive_mind.repository import SqliteHiveMindRepository  # noqa: E402
 _REPO = SqliteHiveMindRepository(DB_PATH)
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_DEAD_AFTER = 60.0
+# STIPHOS heartbeat-lease (2026-09-14): a per-attempt progress lease,
+# distinct from the worker-process heartbeat. A claimed job attempt has
+# until ``now + ATTEMPT_LEASE_SECONDS`` to either complete or explicitly
+# renew. After that, the reaper considers the attempt stuck even if
+# the worker process is still heartbeating normally. The lease is
+# decoupled from the heartbeat by design: a worker can be alive and
+# pinging the hive bus, while a SPECIFIC job attempt it owns has hung.
+# Default 5 minutes is generous enough for a single sub-call (LLM
+# inference / build / test) to make forward progress; short enough
+# that a hung attempt is detected promptly.
+ATTEMPT_LEASE_SECONDS = float(os.environ.get("HIVE_ATTEMPT_LEASE_SECONDS", "300"))
+# How many times an attempt is allowed to have its lease expire and be
+# requeued before the job is finally marked failed (give-up rather
+# than reap-and-retry forever). The bounded-retry policy is required
+# because a perma-stuck job (e.g., a worker with a bug that causes the
+# attempt to always hang just after the first progress point) would
+# otherwise bounce indefinitely between the queue and the reaper.
+ATTEMPT_LEASE_MAX_EXPIRIES = max(1, int(os.environ.get("HIVE_ATTEMPT_LEASE_MAX_EXPIRIES", "3")))
 EVENTS_RETAIN_HOURS = 168  # 7 days
 SYSTEM_LOAD_RETAIN_HOURS = max(0.0, float(os.environ.get("HIVE_SYSTEM_LOAD_RETAIN_HOURS", "0")))
 SSE_PING_INTERVAL = 15.0
@@ -68,6 +86,83 @@ DASHBOARD_ANALYTICS_REFRESH_SECONDS = _positive_env_int(
     "HIVE_DASHBOARD_ANALYTICS_REFRESH_SECONDS", DASHBOARD_LIVE_REFRESH_SECONDS
 )
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
+
+
+# ---------- schema migrations ----------
+
+# Additive column migrations for live DBs. Centralized in a function
+# so both the FastAPI lifespan (full app boot) and tests that bypass the
+# lifespan (raw sqlite3 + service.SCHEMA) can apply the same set.
+# Tests use the sync counterpart below to avoid pulling aiosqlite.
+ADDITIVE_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE agents ADD COLUMN runtime TEXT",
+    "ALTER TABLE agents ADD COLUMN model TEXT",
+    "ALTER TABLE agents ADD COLUMN provider TEXT",
+    "ALTER TABLE agents ADD COLUMN cost_tier TEXT",
+    "ALTER TABLE agents ADD COLUMN autonomy_level TEXT",
+    "ALTER TABLE agents ADD COLUMN auth_method TEXT",
+    "ALTER TABLE agents ADD COLUMN plan_cap_usd REAL",
+    "ALTER TABLE agents ADD COLUMN plan_period_used_usd REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN subscription_pools TEXT",
+    "ALTER TABLE jobs ADD COLUMN project TEXT",
+    "ALTER TABLE jobs ADD COLUMN max_cost_tier TEXT NOT NULL DEFAULT 'A'",
+    "ALTER TABLE jobs ADD COLUMN preferred_providers TEXT",
+    "ALTER TABLE jobs ADD COLUMN preferred_models TEXT",
+    "ALTER TABLE jobs ADD COLUMN mnemos_refs TEXT",
+    "ALTER TABLE jobs ADD COLUMN depends_on TEXT",
+    "ALTER TABLE jobs ADD COLUMN claimed_runtime TEXT",
+    "ALTER TABLE jobs ADD COLUMN claimed_model TEXT",
+    "ALTER TABLE jobs ADD COLUMN claimed_provider TEXT",
+    "ALTER TABLE jobs ADD COLUMN claimed_cost_tier TEXT",
+    "ALTER TABLE jobs ADD COLUMN retry_backoff_until REAL",
+    "ALTER TABLE jobs ADD COLUMN routed_at REAL",
+    "ALTER TABLE jobs ADD COLUMN routing_metadata TEXT",
+    "ALTER TABLE jobs ADD COLUMN result_mnemos_id TEXT",
+    "ALTER TABLE jobs ADD COLUMN tokens_in INTEGER",
+    "ALTER TABLE jobs ADD COLUMN tokens_out INTEGER",
+    "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
+    "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2",
+    # F03 (2026-09-14): per-claim fencing token + attempt generation.
+    "ALTER TABLE jobs ADD COLUMN claim_token TEXT",
+    "ALTER TABLE jobs ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0",
+    # STIPHOS heartbeat-lease (2026-09-14): per-attempt progress lease.
+    # Distinct from the worker heartbeat so a hung attempt on a healthy
+    # worker is detectable.
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_deadline REAL",
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_renewed_at REAL",
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_renewals INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_max_renewals INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_expired_at REAL",
+    "ALTER TABLE jobs ADD COLUMN attempt_lease_expiry_count INTEGER NOT NULL DEFAULT 0",
+)
+
+
+async def _apply_additive_migrations(db) -> None:
+    """Apply ADDITIVE_MIGRATIONS to the given aiosqlite connection. Idempotent:
+    ``ALTER TABLE ... ADD COLUMN`` failures on duplicate-column names are
+    swallowed so a re-run is a no-op. Other failures are logged but not raised
+    (a real DB schema mismatch is a startup-time concern, not a request-time
+    one)."""
+    for stmt in ADDITIVE_MIGRATIONS:
+        try:
+            await db.execute(stmt)
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                print(f"migration warn ({stmt!r}): {e}", flush=True)
+
+
+def apply_additive_migrations_sync(db) -> None:
+    """Sync counterpart of ``_apply_additive_migrations`` for tests that build
+    a throwaway DB via raw ``sqlite3.connect`` (bypassing the FastAPI lifespan).
+    Identical semantics."""
+    for stmt in ADDITIVE_MIGRATIONS:
+        try:
+            db.execute(stmt)
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                print(f"migration warn ({stmt!r}): {e}", flush=True)
+    db.commit()
 
 
 # ---------- helpers ----------
@@ -276,7 +371,23 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- with the stale token from a previous attempt. Reaper -> requeue resets
   -- attempt_generation to a new value (the new claim bumps it again).
   claim_token TEXT,
-  attempt_generation INTEGER NOT NULL DEFAULT 0
+  attempt_generation INTEGER NOT NULL DEFAULT 0,
+  -- STIPHOS heartbeat-lease (2026-09-14): per-attempt progress lease,
+  -- distinct from the worker's general heartbeat. Set on a successful
+  -- claim to (now + ATTEMPT_LEASE_SECONDS); renewed by the worker via
+  -- POST /v1/jobs/{id}/lease/renew with the live claim_token. The reaper
+  -- treats a lapsed lease as the authoritative reap signal — even if
+  -- the worker process is still heartbeating normally (because
+  -- "worker alive" != "this specific attempt is still making forward
+  -- progress"). A bounded number of lease expiries is allowed before
+  -- the job is finally marked failed (give-up rather than infinite
+  -- reap-and-retry).
+  attempt_lease_deadline REAL,
+  attempt_lease_renewed_at REAL,
+  attempt_lease_renewals INTEGER NOT NULL DEFAULT 0,
+  attempt_lease_max_renewals INTEGER NOT NULL DEFAULT 0,
+  attempt_lease_expired_at REAL,
+  attempt_lease_expiry_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn);
@@ -324,6 +435,36 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(enabled, next_fire_at);
+
+-- STIPHOS scheduler (2026-09-14): a DB-level atomic fire record. Each
+-- attempt by a scheduler tick to fire a given (schedule_id, scheduled_for)
+-- pair is recorded as a row here BEFORE the corresponding job is inserted
+-- and BEFORE scheduled_jobs.next_fire_at is advanced. The unique index
+-- on (schedule_id, scheduled_for) is the SOURCE OF TRUTH that prevents
+-- two scheduler processes (or one process whose tick loop runs twice
+-- before it can advance next_fire_at) from creating two jobs for the
+-- same fire instant. The scheduled_for column stores the wall-clock
+-- scheduled fire instant (real seconds since epoch) so two ticks that
+-- read the same next_fire_at value will collide on this row and only
+-- one will succeed.
+--
+-- A separate fire-record table (rather than a UNIQUE index on the
+-- scheduled_jobs row itself) is what makes the outbox pattern work:
+-- the fire record is the advanceable, terminal fact, and advancement
+-- of next_fire_at becomes a derived state — once a fire row exists,
+-- the schedule is logically "already past" that fire instant and the
+-- next fire is computed from the recorded scheduled_for, not from a
+-- mutable pointer that can desync from reality if the process crashes
+-- between insert_job and UPDATE scheduled_jobs.
+CREATE TABLE IF NOT EXISTS schedule_fires (
+  schedule_id TEXT NOT NULL,
+  scheduled_for REAL NOT NULL,
+  fired_at REAL NOT NULL,
+  job_id TEXT,
+  PRIMARY KEY (schedule_id, scheduled_for)
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_fires_job_id
+  ON schedule_fires(job_id);
 
 CREATE TABLE IF NOT EXISTS worker_kind_stats (
   urn TEXT NOT NULL,
@@ -1009,11 +1150,38 @@ class MessagePublish(BaseModel):
 # ---------- lifecycle ----------
 
 async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
-    """Mark stale agents offline and atomically release only their owned jobs."""
+    """Mark stale agents offline and atomically release only their owned jobs.
+
+    Two reap triggers (either is sufficient — the first one to fire on a given
+    job wins):
+
+    1. **Worker heartbeat stale** (pre-existing): the claiming agent's
+       ``last_heartbeat`` is older than ``HEARTBEAT_DEAD_AFTER``. Identifies
+       the case where the WORKER PROCESS is gone (or the network is wedged).
+
+    2. **Per-attempt lease expired** (STIPHOS 2026-09-14): the job's own
+       ``attempt_lease_deadline`` is in the past, regardless of the worker's
+       heartbeat. This is the case where the worker is alive and heartbeating
+       normally but THIS SPECIFIC ATTEMPT has hung. Without this second
+       trigger, a stuck attempt on a healthy worker would block forever —
+       a worker that's heartbeating every 5 seconds will never trip the
+       heartbeat-stale trigger, no matter how dead its actual attempt is.
+
+    Both paths bump ``attempt_generation`` (per F03), clear ``claim_token``,
+    and close the prior ``job_attempts`` row as ``'reaped'``.
+
+    Bounded retry (give-up policy): each reap increments
+    ``attempt_lease_expiry_count``. When that count reaches
+    ``ATTEMPT_LEASE_MAX_EXPIRIES``, the job is marked ``failed`` rather
+    than requeued — this prevents a perma-stuck job from bouncing between
+    the queue and the reaper forever.
+    """
     cutoff = now - HEARTBEAT_DEAD_AFTER
     offline_count = 0
     requeued_count = 0
+    given_up_count = 0
     async with aiosqlite.connect(DB_PATH) as db:
+        # --- 1. stale agents -> offline ---
         async with db.execute(
             "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
             (cutoff,),
@@ -1029,6 +1197,103 @@ async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
                 offline_count += 1
                 await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
 
+        # --- 2. STIPHOS lease-expired jobs (independent of worker heartbeat) ---
+        # Select: claimed/running AND attempt_lease_deadline is set AND has lapsed.
+        async with db.execute(
+            "SELECT id, claimed_by, attempt_lease_expiry_count "
+            "FROM jobs "
+            "WHERE status IN ('claimed','running') "
+            "AND attempt_lease_deadline IS NOT NULL "
+            "AND attempt_lease_deadline < ?",
+            (now,),
+        ) as cur:
+            lease_candidates = [(r[0], r[1], r[2] or 0) async for r in cur]
+        for job_id, claimer, prior_expiries in lease_candidates:
+            # Bounded retry: if this job has already hit the expiry cap,
+            # mark it failed rather than requeue. This is the "give up
+            # rather than reap-and-retry forever" leg of the bounded
+            # retry/reap policy.
+            if prior_expiries + 1 >= ATTEMPT_LEASE_MAX_EXPIRIES:
+                updated = await db.execute(
+                    "UPDATE jobs SET status='failed', ended_at=?, "
+                    "attempt_lease_expired_at=?, "
+                    "attempt_lease_expiry_count = attempt_lease_expiry_count + 1, "
+                    "claim_token=NULL, attempt_generation = attempt_generation + 1, "
+                    "claimed_by=NULL, claimed_at=NULL, "
+                    "claimed_runtime=NULL, claimed_model=NULL, "
+                    "claimed_provider=NULL, claimed_cost_tier=NULL "
+                    "WHERE id=? AND status IN ('claimed','running') "
+                    "AND attempt_lease_deadline IS NOT NULL "
+                    "AND attempt_lease_deadline < ?",
+                    (now, now, job_id, now),
+                )
+                if updated.rowcount == 1:
+                    given_up_count += 1
+                    await emit_event(
+                        db,
+                        "job.failed",
+                        {
+                            "id": job_id,
+                            "prior_claimer": claimer,
+                            "reason": "attempt_lease_max_expiries_reached",
+                            "expiries": prior_expiries + 1,
+                            "cap": ATTEMPT_LEASE_MAX_EXPIRIES,
+                        },
+                    )
+                    try:
+                        await _REPO.mark_attempt_reaped(
+                            job_id=job_id,
+                            prior_claimer=claimer,
+                            reason="attempt_lease_max_expiries_reached",
+                            now=now,
+                        )
+                    except Exception as reap_audit_exc:
+                        print(
+                            f"STIPHOS lease giveup-audit stamp failed for job={job_id}: {reap_audit_exc}",
+                            flush=True,
+                        )
+                continue
+            # Otherwise: requeue with bumped generation + incremented expiry count.
+            updated = await db.execute(
+                "UPDATE jobs SET status='queued', "
+                "claimed_by=NULL, claimed_at=NULL, "
+                "claimed_runtime=NULL, claimed_model=NULL, "
+                "claimed_provider=NULL, claimed_cost_tier=NULL, "
+                "claim_token=NULL, attempt_generation = attempt_generation + 1, "
+                "attempt_lease_deadline=NULL, attempt_lease_renewed_at=NULL, "
+                "attempt_lease_expired_at=?, "
+                "attempt_lease_expiry_count = attempt_lease_expiry_count + 1 "
+                "WHERE id=? AND status IN ('claimed','running') "
+                "AND attempt_lease_deadline IS NOT NULL "
+                "AND attempt_lease_deadline < ?",
+                (now, job_id, now),
+            )
+            if updated.rowcount == 1:
+                requeued_count += 1
+                await emit_event(
+                    db,
+                    "job.unclaimed",
+                    {
+                        "id": job_id,
+                        "prior_claimer": claimer,
+                        "reason": "attempt_lease_expired",
+                        "lease_expiries": prior_expiries + 1,
+                    },
+                )
+                try:
+                    await _REPO.mark_attempt_reaped(
+                        job_id=job_id,
+                        prior_claimer=claimer,
+                        reason="attempt_lease_expired",
+                        now=now,
+                    )
+                except Exception as reap_audit_exc:
+                    print(
+                        f"STIPHOS lease-audit stamp failed for job={job_id}: {reap_audit_exc}",
+                        flush=True,
+                    )
+
+        # --- 3. pre-existing heartbeat-stale requeue (F03 path) ---
         async with db.execute(
             "SELECT j.id, j.claimed_by FROM jobs j "
             "LEFT JOIN agents a ON a.urn=j.claimed_by "
@@ -1044,10 +1309,14 @@ async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
                 # GUARANTEED not to match the new generation. The prior
                 # attempt_generation row in job_attempts is closed as 'reaped'
                 # by the mark_attempt_reaped call below for audit.
+                # STIPHOS (2026-09-14): also clear the per-attempt lease so a
+                # re-claim gets a fresh lease deadline (and the prior expiry
+                # accounting persists on attempt_lease_expiry_count).
                 "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                 "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
                 "claimed_cost_tier=NULL, claim_token=NULL, "
-                "attempt_generation = attempt_generation + 1 "
+                "attempt_generation = attempt_generation + 1, "
+                "attempt_lease_deadline=NULL, attempt_lease_renewed_at=NULL "
                 "WHERE id=? AND claimed_by=? AND status IN ('claimed','running') "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM agents WHERE urn=? AND last_heartbeat >= ?"
@@ -1092,20 +1361,89 @@ async def reaper_task(app: FastAPI):
         try:
             await _reap_stale_agents_and_jobs(time.time())
             async with aiosqlite.connect(DB_PATH) as db:
-                # Scheduler — fire due interval-based jobs
+                # STIPHOS scheduler (2026-09-14): atomic fire identity via the
+                # schedule_fires table. For each due schedule, we INSERT a row
+                # keyed by (schedule_id, scheduled_for) — the unique index on
+                # that pair is the DB-level guarantee that no two scheduler
+                # ticks (in this process or across processes) can create two
+                # jobs for the same fire instant. If the INSERT fails on
+                # UNIQUE, another tick already fired this instant; skip and
+                # advance next_fire_at to prevent it from being considered
+                # due again next tick.
                 now_ts = time.time()
                 async with db.execute(
-                    "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
-                    "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
+                    "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count, "
+                    "next_fire_at FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
                     (now_ts,),
                 ) as cur:
                     due = [tuple(r) async for r in cur]
-                for sched_id, sname, sub_urn, interval, tpl_json, fcount in due:
+                for sched_id, sname, sub_urn, interval, tpl_json, fcount, scheduled_for in due:
                     try:
                         tpl = json.loads(tpl_json)
                         tpl["submitter_urn"] = sub_urn
-                        # synth a JobCreate + go through the cache+role machinery
-                        await create_job(JobCreate(**tpl), _internal_agent_request(sub_urn))
+                        # Phase A: record the fire identity FIRST. If two
+                        # scheduler processes both saw the same due row, only
+                        # one INSERT INTO schedule_fires succeeds; the loser
+                        # sees IntegrityError and bails out for this tick.
+                        # This is the OUTBOX record — once it exists, the
+                        # fire has logically happened (and is deduped at the
+                        # DB level), independent of whether the
+                        # create_job/scheduled_jobs.UPDATE pair succeeded.
+                        try:
+                            await db.execute(
+                                "INSERT INTO schedule_fires "
+                                "(schedule_id, scheduled_for, fired_at, job_id) "
+                                "VALUES (?, ?, ?, NULL)",
+                                (sched_id, scheduled_for, now_ts),
+                            )
+                        except aiosqlite.IntegrityError:
+                            # Already fired by a concurrent tick. Skip job
+                            # creation but still advance next_fire_at so the
+                            # row stops being due on subsequent ticks.
+                            await db.execute(
+                                "UPDATE scheduled_jobs SET next_fire_at=? WHERE id=? "
+                                "AND next_fire_at <= ?",
+                                (now_ts + interval, sched_id, now_ts),
+                            )
+                            await emit_event(
+                                db,
+                                "schedule.fire_skipped",
+                                {
+                                    "schedule_id": sched_id,
+                                    "name": sname,
+                                    "scheduled_for": scheduled_for,
+                                    "reason": "duplicate_fire_record",
+                                },
+                            )
+                            continue
+                        # Phase B: synthesize the JobCreate and insert the job.
+                        # The fire record is now the durable, deduped
+                        # commitment that THIS fire happened. If
+                        # create_job fails, the schedule_fires row remains
+                        # (so the next tick does NOT re-fire the same
+                        # instant), but the job itself is missing — which
+                        # is intentional: we don't want a crash to leave
+                        # a phantom next_fire_at + an already-fired record
+                        # with no actual job. Operators can inspect
+                        # schedule_fires.job_id IS NULL to find such gaps.
+                        created_job_id = None
+                        created = await create_job(JobCreate(**tpl), _internal_agent_request(sub_urn))
+                        if isinstance(created, dict):
+                            created_job_id = created.get("id")
+                        if created_job_id:
+                            await db.execute(
+                                "UPDATE schedule_fires SET job_id=? "
+                                "WHERE schedule_id=? AND scheduled_for=?",
+                                (created_job_id, sched_id, scheduled_for),
+                            )
+                        # Phase C: advance next_fire_at. Done in the same
+                        # transaction as the fire record INSERT and the
+                        # schedule_fires.job_id UPDATE above (the outer
+                        # `async with aiosqlite.connect(...)` commits at
+                        # the bottom of this block). That commit is the
+                        # atomic boundary: either all three happen
+                        # (fire-record + job + advancement) or none of
+                        # them do.
                         await db.execute(
                             "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
                             "fire_count=fire_count+1 WHERE id=?",
@@ -1117,8 +1455,10 @@ async def reaper_task(app: FastAPI):
                             {
                                 "schedule_id": sched_id,
                                 "name": sname,
+                                "scheduled_for": scheduled_for,
                                 "fire_count": fcount + 1,
                                 "next_at": now_ts + interval,
+                                "job_id": created_job_id,
                             },
                         )
                     except Exception as se:
@@ -1173,53 +1513,18 @@ async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
-        # Additive migrations for live DBs. Keep this list in lockstep with
-        # columns used by endpoints and SqliteHiveMindRepository.
-        # Add-only via ALTER TABLE; ignore "duplicate column" errors so reruns are no-ops.
-        migrations = (
-            "ALTER TABLE agents ADD COLUMN runtime TEXT",
-            "ALTER TABLE agents ADD COLUMN model TEXT",
-            "ALTER TABLE agents ADD COLUMN provider TEXT",
-            "ALTER TABLE agents ADD COLUMN cost_tier TEXT",
-            "ALTER TABLE agents ADD COLUMN autonomy_level TEXT",
-            "ALTER TABLE agents ADD COLUMN auth_method TEXT",
-            "ALTER TABLE agents ADD COLUMN plan_cap_usd REAL",
-            "ALTER TABLE agents ADD COLUMN plan_period_used_usd REAL NOT NULL DEFAULT 0",
-            "ALTER TABLE agents ADD COLUMN subscription_pools TEXT",
-            "ALTER TABLE jobs ADD COLUMN project TEXT",
-            "ALTER TABLE jobs ADD COLUMN max_cost_tier TEXT NOT NULL DEFAULT 'A'",
-            "ALTER TABLE jobs ADD COLUMN preferred_providers TEXT",
-            "ALTER TABLE jobs ADD COLUMN preferred_models TEXT",
-            "ALTER TABLE jobs ADD COLUMN mnemos_refs TEXT",
-            "ALTER TABLE jobs ADD COLUMN depends_on TEXT",
-            "ALTER TABLE jobs ADD COLUMN claimed_runtime TEXT",
-            "ALTER TABLE jobs ADD COLUMN claimed_model TEXT",
-            "ALTER TABLE jobs ADD COLUMN claimed_provider TEXT",
-            "ALTER TABLE jobs ADD COLUMN claimed_cost_tier TEXT",
-            "ALTER TABLE jobs ADD COLUMN retry_backoff_until REAL",
-            "ALTER TABLE jobs ADD COLUMN routed_at REAL",
-            "ALTER TABLE jobs ADD COLUMN routing_metadata TEXT",
-            "ALTER TABLE jobs ADD COLUMN result_mnemos_id TEXT",
-            "ALTER TABLE jobs ADD COLUMN tokens_in INTEGER",
-            "ALTER TABLE jobs ADD COLUMN tokens_out INTEGER",
-            "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
-            "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2",
-            # F03 (2026-09-14): per-claim fencing token + attempt generation.
-            "ALTER TABLE jobs ADD COLUMN claim_token TEXT",
-            "ALTER TABLE jobs ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0",
-        )
-        for stmt in migrations:
-            try:
-                await db.execute(stmt)
-            except Exception as e:
-                if "duplicate column" not in str(e).lower():
-                    print(f"migration warn ({stmt!r}): {e}", flush=True)
+        # Additive migrations for live DBs. See ADDITIVE_MIGRATIONS.
+        await _apply_additive_migrations(db)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until)")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_costs ON jobs(ended_at, claimed_provider, claimed_model)"
         )
+        # STIPHOS scheduler (2026-09-14): the schedule_fires index is
+        # already created via SCHEMA, but the additive migrations above
+        # are run AFTER SCHEMA, so it's fine. The schedule_fires
+        # PRIMARY KEY (schedule_id, scheduled_for) provides the unique
+        # constraint for the atomic fire-record dedup.
         await db.commit()
     app.state.reaper_last_success = time.time()
     app.state.reaper_last_error = None
@@ -2249,6 +2554,167 @@ async def route_job(job_id: str, req: JobRoutingUpdate, request: Request):
             },
         )
     return {"ok": True, "id": job_id, "routed_at": now}
+
+
+# ---------- STIPHOS heartbeat-lease endpoints (2026-09-14) ----------
+
+
+class JobLeaseRenew(BaseModel):
+    """Body for POST /v1/jobs/{job_id}/lease/renew. The worker must echo
+    the live ``claim_token`` (same fencing rule as /v1/jobs/{id}) plus
+    optionally an explicit extension in seconds; the default is
+    ``ATTEMPT_LEASE_SECONDS``."""
+
+    claim_token: str
+    extension_seconds: Optional[float] = None
+    reason: Optional[str] = None
+
+
+class JobCancelAttempt(BaseModel):
+    """Body for POST /v1/jobs/{job_id}/lease/cancel. Cancellation
+    acknowledgment — the worker is telling the hive "I am stopping this
+    attempt, do not count it as a hung-lease reap". The job is requeued
+    with a fresh attempt_generation and a fresh lease on the next claim."""
+
+    claim_token: str
+    reason: str = "worker_cancelled_attempt"
+
+
+@app.post("/v1/jobs/{job_id}/lease/renew")
+async def renew_job_lease(job_id: str, req: JobLeaseRenew, request: Request):
+    """STIPHOS heartbeat-lease (2026-09-14): explicitly renew the
+    per-attempt progress lease. Distinct from the worker's general
+    heartbeat — this proves the SPECIFIC attempt is still making
+    forward progress. Workers should call this periodically (typically
+    every ``ATTEMPT_LEASE_SECONDS / 2``) between work units.
+
+    Fencing: the renewal is atomic on the live ``claim_token``. A stale
+    token (from a reaped/reclaimed attempt) is rejected with 409 — the
+    same way a stale completion would be. This closes the race where a
+    worker is still heartbeating after its attempt was reaped and a
+    different worker has already taken over.
+
+    On success: returns the new lease deadline and the renewal count.
+    On reject: 409 with the reason (stale_claim_token / not_claimable /
+    renewal_cap_reached).
+    """
+    caller = _require_agent(request, None)
+    now = time.time()
+    extension = req.extension_seconds if req.extension_seconds is not None else None
+    # Authorization: the caller must ALSO be the live claimer of this job
+    # (not just any authenticated agent). Read claimed_by first; the
+    # token check below still rejects a stale token even if the caller
+    # is the live claimer, but we want to fail fast on the cross-agent
+    # case with 403 instead of 409.
+    async with aiosqlite.connect(DB_PATH) as auth_db:
+        async with auth_db.execute(
+            "SELECT claimed_by FROM jobs WHERE id=?", (job_id,)
+        ) as cur:
+            auth_row = await cur.fetchone()
+    if not auth_row:
+        raise HTTPException(404, f"job not found: {job_id}")
+    current_claimer = auth_row[0]
+    if current_claimer and caller != current_claimer:
+        raise HTTPException(403, "job is owned by a different worker")
+    result = await _REPO.renew_attempt_lease(
+        job_id=job_id,
+        claim_token=req.claim_token,
+        now=now,
+        extension_seconds=extension,
+    )
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        if reason == "stale_claim_token":
+            raise HTTPException(
+                409,
+                "stale claim_token: this job's current attempt has a different "
+                "claim_token (reaped + re-claimed; your token is from a prior attempt)",
+            )
+        if reason == "not_claimable":
+            raise HTTPException(409, "job is not in claimed/running state")
+        if reason == "renewal_cap_reached":
+            raise HTTPException(
+                409,
+                "attempt_lease_max_renewals cap reached; the attempt is permanently "
+                "exhausted and must complete or fail to make progress",
+            )
+        if reason == "not_found":
+            raise HTTPException(404, f"job not found: {job_id}")
+        raise HTTPException(409, f"renewal rejected: {reason}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await emit_event(
+            db,
+            "job.lease_renewed",
+            {
+                "id": job_id,
+                "lease_deadline": result["lease_deadline"],
+                "renewed_at": result["renewed_at"],
+                "renewals": result["renewals"],
+                "reason": req.reason,
+            },
+        )
+    return {
+        "ok": True,
+        "id": job_id,
+        "lease_deadline": result["lease_deadline"],
+        "renewed_at": result["renewed_at"],
+        "renewals": result["renewals"],
+        "previous_deadline": result.get("previous_deadline"),
+    }
+
+
+@app.post("/v1/jobs/{job_id}/lease/cancel")
+async def cancel_job_attempt(job_id: str, req: JobCancelAttempt, request: Request):
+    """STIPHOS heartbeat-lease cancellation-acknowledgment (2026-09-14):
+    the worker explicitly cancels its OWN in-flight attempt and asks the
+    hive to requeue. This is the cooperative cancellation path; it does
+    NOT count as a hung-lease reap (the job is requeued with a fresh
+    attempt_generation, not reaped after a timeout).
+
+    Fencing: same as renew — the caller's ``claim_token`` must match
+    the live attempt, otherwise 409.
+    """
+    caller = _require_agent(request, None)
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as auth_db:
+        async with auth_db.execute(
+            "SELECT claimed_by FROM jobs WHERE id=?", (job_id,)
+        ) as cur:
+            auth_row = await cur.fetchone()
+    if not auth_row:
+        raise HTTPException(404, f"job not found: {job_id}")
+    current_claimer = auth_row[0]
+    if current_claimer and caller != current_claimer:
+        raise HTTPException(403, "job is owned by a different worker")
+    result = await _REPO.cancel_attempt(
+        job_id=job_id,
+        claim_token=req.claim_token,
+        now=now,
+        reason=req.reason,
+    )
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        if reason == "stale_claim_token":
+            raise HTTPException(
+                409,
+                "stale claim_token: cancellation requires the LIVE attempt's token",
+            )
+        if reason == "not_claimable":
+            raise HTTPException(409, "job is not in claimed/running state")
+        if reason == "not_found":
+            raise HTTPException(404, f"job not found: {job_id}")
+        raise HTTPException(409, f"cancel rejected: {reason}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await emit_event(
+            db,
+            "job.attempt_cancelled",
+            {
+                "id": job_id,
+                "reason": req.reason,
+                "cancelled_at": now,
+            },
+        )
+    return {"ok": True, "id": job_id, "cancelled_at": now, "requeued": True}
 
 
 @app.post("/v1/schedules")

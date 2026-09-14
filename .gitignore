@@ -19,4 +19,5 @@ venv/
 # Scratch task description / run log dropped at repo root by the prior
 # fix attempts (F03 2026-09-14). Same rationale as the zoder scratch file.
 TASK_F*.md
+TASK_SCHEDULER.md
 zoder_run.log
