@@ -343,7 +343,13 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
                 )
             ]
         if name == "hive.agent_list":
-            r = await _hive("GET", "/v1/agents", bootstrap=True, params={k: v for k, v in args.items() if v})
+            # F02 (2026-09-14): bootstrap credentials are registration-only
+            # and no longer have fleet read scope. The MCP orchestrator
+            # operates as an admin-equivalent caller for fleet-wide reads,
+            # so use the admin credential here. Registration still uses
+            # bootstrap because that is the legitimate purpose of the
+            # bus token.
+            r = await _hive("GET", "/v1/agents", admin=True, params={k: v for k, v in args.items() if v})
         elif name == "hive.agent_register":
             r = await _hive("POST", "/v1/agents/register", bootstrap=True, json=args)
         elif name == "hive.job_create":
@@ -370,7 +376,11 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
             agent_token = payload.pop("agent_token", None)
             r = await _hive("POST", "/v1/messages", agent_token=agent_token, json=payload)
         elif name == "hive.message_list":
-            r = await _hive("GET", "/v1/messages", bootstrap=True, params={k: v for k, v in args.items() if v})
+            # F02 (2026-09-14): bootstrap credentials are registration-only
+            # and no longer have fleet read scope. The MCP orchestrator runs
+            # as an admin-equivalent caller when introspecting the bus; use
+            # the admin credential here instead of bootstrap.
+            r = await _hive("GET", "/v1/messages", admin=True, params={k: v for k, v in args.items() if v})
         elif name == "mnemos.memory_search":
             r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos.memory_create":

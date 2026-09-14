@@ -790,18 +790,31 @@ async def _event_visible_to_agent(
     if kind.startswith(_JOB_AUDIENCE_KINDS_PREFIX) or kind == "job":
         job_id = payload.get("id")
         if not job_id:
-            return True
+            # Malformed event: we cannot verify audience, so deny rather than
+            # fail open. A job.* event without an id is broken at the source.
+            return False
         return await _job_row_visible_to_agent(job_id, agent_urn, agent_ctx, now)
     if kind == "message":
         to_urn = payload.get("to")
         from_urn = payload.get("from")
-        if not to_urn:
-            return True  # broadcast message
-        if agent_urn and (to_urn == agent_urn or from_urn == agent_urn):
-            return True
-        return False
+        # A direct message MUST have a recipient. A message without `to`
+        # is a broadcast (visible to every authenticated agent) provided it
+        # has a sender — that is the only valid shape that the publish
+        # endpoint emits. A malformed message with neither `to` nor `from`
+        # is denied: we cannot verify audience, so fail closed.
+        if to_urn is None:
+            return from_urn is not None
+        if not agent_urn:
+            return False
+        return to_urn == agent_urn or from_urn == agent_urn
+    # Other event kinds (agent.online / agent.offline, schedule.fired, …) are
+    # addressed to a specific agent: visible to that agent, hidden from others.
+    # Unaddressed events (no urn anywhere) are broadcast — they are fleet-wide
+    # notices by convention (e.g. "schedule.fired" is operational metadata,
+    # not private content). Admin/internal callers are handled by the
+    # short-circuit at the top of this function.
     target = event.get("agent_urn") or payload.get("urn")
-    if not target:
+    if target is None:
         return True
     if agent_urn and target == agent_urn:
         return True
@@ -2603,7 +2616,11 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
         finally:
             EVENT_QUEUE.pop(sub_id, None)
 
-    return EventSourceResponse(gen())
+    # Use the same ping interval for the sse_starlette keep-alive task as
+    # the inline generator's queue.get() timeout — both honour the
+    # SSE_PING_INTERVAL module constant so tests can shrink it without
+    # waiting 15s for keep-alives.
+    return EventSourceResponse(gen(), ping=SSE_PING_INTERVAL)
 
 
 @app.get("/v1/events/log")
@@ -2662,12 +2679,21 @@ async def events_log(
                 )
     now = time.time()
     rows = []
+    # last_id is the highest event id the caller has CONSIDERED, not the
+    # highest id they were allowed to see. When every event in the window is
+    # hidden by the audience filter, last_id still advances past them so the
+    # client's next poll (since_id=last_id) makes forward progress instead of
+    # re-querying the same window forever. Match the original contract when
+    # the DB has nothing past since_id: last_id stays at since_id (so the
+    # client knows it is "caught up" — None when no cursor was given).
     last_id = since_id
     for ev in raw_rows:
+        ev_id = int(ev["id"])
+        if last_id is None or ev_id > last_id:
+            last_id = ev_id
         if not await _event_visible_to_agent(ev, caller_urn, caller_ctx, now):
             continue
         rows.append(ev)
-        last_id = ev["id"]
     return {"count": len(rows), "events": rows, "last_id": last_id}
 
 
