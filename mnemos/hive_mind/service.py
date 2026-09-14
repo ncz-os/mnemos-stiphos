@@ -283,15 +283,24 @@ def make_urn(kind: str, host: str, session_id: str) -> str:
 async def emit_event(db, kind: str, payload: dict) -> None:
     ts = time.time()
     payload_json = json.dumps(payload, separators=(",", ":"))
-    await db.execute(
+    cursor = await db.execute(
         "INSERT INTO events (ts, kind, payload, agent_urn) VALUES (?, ?, ?, ?)",
         (ts, kind, payload_json, payload.get("urn") or payload.get("agent_urn")),
     )
+    # F04/STIPHOS (2026-09-14): capture the persisted event id so live SSE
+    # subscribers receive the SAME durable identifier the catch-up/history
+    # path reads from the events table. Previously the broadcast payload
+    # carried only {kind, ts, payload} with no id — making reconnect/catch-up
+    # via since_id impossible from the live path, and a queue-full drop
+    # unrecoverable. Now the live event carries the autoincrement id assigned
+    # by the events table on this INSERT; the SSE wire layer forwards it as
+    # the SSE `id:` field so clients can resume cleanly with since_id=N.
+    event_id = cursor.lastrowid
     await db.commit()
     # broadcast to live SSE subscribers
     for q in list(EVENT_QUEUE.values()):
         try:
-            q.put_nowait({"kind": kind, "ts": ts, "payload": payload})
+            q.put_nowait({"id": event_id, "kind": kind, "ts": ts, "payload": payload})
         except asyncio.QueueFull:
             pass
 
@@ -3279,10 +3288,23 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                     evt = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
                     if not await _event_visible_to_agent(evt, caller_urn, caller_ctx, time.time()):
                         continue
-                    yield {
+                    # F04/STIPHOS (2026-09-14): live SSE events now carry the
+                    # SAME persisted event id the catch-up/history read path
+                    # uses. Yield the wire `id:` field so the client can
+                    # resume cleanly with since_id=N on reconnect — turning a
+                    # queue-full drop into a recoverable gap instead of a
+                    # silent miss. A missing id here would indicate an
+                    # emit_event call that bypassed the persistence write
+                    # (e.g. an in-memory-only fan-out); we fall back to
+                    # omitting the wire id rather than fabricating one.
+                    wire_id = evt.get("id")
+                    wire_kwargs = {
                         "event": evt["kind"],
                         "data": json.dumps(evt),
                     }
+                    if wire_id is not None:
+                        wire_kwargs["id"] = str(wire_id)
+                    yield wire_kwargs
                 except asyncio.TimeoutError:
                     if time.time() - last_ping >= SSE_PING_INTERVAL:
                         yield {"event": "ping", "data": str(int(time.time()))}
