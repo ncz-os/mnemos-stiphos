@@ -579,6 +579,13 @@ import hashlib as _hashlib
 
 CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lints often valid much longer
 
+# F12 (2026-09-14): upper bound on the serialized JSON size we are willing to
+# write into hive_cache.result_json. Historically the cache silently truncated
+# at 32_000 characters, which produced invalid JSON and poisoned subsequent
+# cache reads with a json.JSONDecodeError. A cache miss is always safe; a
+# corrupted cache hit is not. Oversized payloads are simply not cached.
+CACHE_RESULT_JSON_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB serialized JSON
+
 
 def cache_key_for(
     kind: str,
@@ -637,8 +644,34 @@ async def cache_lookup(db, cache_key: str) -> Optional[dict]:
         r = await cur.fetchone()
     if not r:
         return None
+    raw = r[0]
+    # F12 (2026-09-14): older builds could write a 32_000-char-truncated slice
+    # of result_json to the cache, which is no longer valid JSON. Treat any
+    # decode failure here as a cache miss and evict the poisoned row so the
+    # next write of the same key gets a clean slate.
+    try:
+        decoded = json.loads(raw) if raw else None
+    except (ValueError, TypeError) as exc:
+        print(
+            f"cache_lookup: evicting malformed cache entry "
+            f"cache_key={cache_key[:16]}... err={exc!r}",
+            flush=True,
+        )
+        try:
+            await db.execute(
+                "DELETE FROM hive_cache WHERE cache_key=?",
+                (cache_key,),
+            )
+            await db.commit()
+        except Exception as del_exc:  # noqa: BLE001 — best-effort eviction
+            print(
+                f"cache_lookup: failed to evict malformed entry "
+                f"cache_key={cache_key[:16]}... del_err={del_exc!r}",
+                flush=True,
+            )
+        return None
     return {
-        "result": json.loads(r[0]) if r[0] else None,
+        "result": decoded,
         "source_job_id": r[1],
         "result_mnemos_id": r[2],
         "hit_count": r[3],
@@ -660,6 +693,19 @@ async def cache_store(
     cost_for_save: float,
 ):
     now = time.time()
+    serialized = json.dumps(result, default=str)
+    # F12 (2026-09-14): never silently write a truncated/invalid JSON string
+    # to the cache. If the serialized payload exceeds the size bound, skip
+    # caching entirely — a cache miss is safe, a corrupted cache hit is not.
+    # See CACHE_RESULT_JSON_MAX_BYTES for the rationale.
+    if len(serialized.encode("utf-8")) > CACHE_RESULT_JSON_MAX_BYTES:
+        print(
+            f"cache_store: skipping oversized cache entry "
+            f"cache_key={cache_key[:16]}... size={len(serialized)} "
+            f"max={CACHE_RESULT_JSON_MAX_BYTES}",
+            flush=True,
+        )
+        return
     await db.execute(
         "INSERT INTO hive_cache (cache_key, result_json, source_job_id, result_mnemos_id, "
         "hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at) "
@@ -668,7 +714,7 @@ async def cache_store(
         "result_json=excluded.result_json, source_job_id=excluded.source_job_id, "
         "result_mnemos_id=excluded.result_mnemos_id, cached_at=excluded.cached_at, "
         "model=excluded.model, provider=excluded.provider",
-        (cache_key, json.dumps(result, default=str)[:32000], source_job_id, result_mnemos_id, model, provider, now),
+        (cache_key, serialized, source_job_id, result_mnemos_id, model, provider, now),
     )
 
 
