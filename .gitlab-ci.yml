@@ -1,4 +1,4 @@
-# GitLab CI — Python "real errors" gate (ruff, high-signal rules only).
+# GitLab CI — high-signal lint and executable regression suites.
 # GitLab SaaS shared runners (free OSS minutes), no fleet CPU. Catches syntax
 # errors + undefined names (E9,F63,F7,F82); stylistic/style-of-imports rules
 # (E402/E501, unused imports) are intentionally NOT gated here — tighten per repo
@@ -13,6 +13,17 @@ ruff:
     - pip install --quiet ruff
   script:
     - ruff check --select E9,F63,F7,F82 --output-format=concise .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+pytest:
+  stage: check
+  image: python:3.13-slim
+  before_script:
+    - python -m pip install --quiet  -e ".[test,mcp]" pytest pytest-asyncio aiosqlite
+  script:
+    - python -m pytest tests/ -q
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push"'
