@@ -9,12 +9,14 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 """
 
 from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
 import os
 import re
 import secrets
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -24,10 +26,9 @@ from typing import Optional
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from mnemos.hive_mind.config import agent_bus_db_env
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-
-from mnemos.hive_mind.config import agent_bus_db_env
 
 DB_PATH = agent_bus_db_env()
 HIVE_BUS_TOKEN_ENV_NAMES = ("HIVE_BUS_TOKEN", "MNEMOS_HIVE_BUS_TOKEN")
@@ -1021,6 +1022,11 @@ async def _event_visible_to_agent(
             # fail open. A job.* event without an id is broken at the source.
             return False
         return await _job_row_visible_to_agent(job_id, agent_urn, agent_ctx, now)
+    if kind == "schedule.fired":
+        job_id = payload.get("job_id")
+        return bool(job_id) and await _job_row_visible_to_agent(
+            job_id, agent_urn, agent_ctx, now
+        )
     if kind == "message":
         to_urn = payload.get("to")
         from_urn = payload.get("from")
@@ -1034,11 +1040,10 @@ async def _event_visible_to_agent(
         if not agent_urn:
             return False
         return to_urn == agent_urn or from_urn == agent_urn
-    # Other event kinds (agent.online / agent.offline, schedule.fired, …) are
+    # Other event kinds (agent.online / agent.offline, …) are
     # addressed to a specific agent: visible to that agent, hidden from others.
     # Unaddressed events (no urn anywhere) are broadcast — they are fleet-wide
-    # notices by convention (e.g. "schedule.fired" is operational metadata,
-    # not private content). Admin/internal callers are handled by the
+    # notices by convention. Admin/internal callers are handled by the
     # short-circuit at the top of this function.
     target = event.get("agent_urn") or payload.get("urn")
     if target is None:
@@ -1364,116 +1369,102 @@ async def _reap_stale_agents_and_jobs(now: float) -> tuple[int, int]:
     return offline_count, requeued_count
 
 
+async def _fire_due_schedules(now: float) -> None:
+    """Deliver durable schedule intents without holding a writer across dispatch.
+
+    Job IDs are deterministic and private to this path. A crash after inserting
+    the job but before linking the intent therefore resumes the same job. The
+    jobs primary key arbitrates concurrent dispatchers; null intents remain
+    retryable after validation, storage, or transport failures.
+    """
+    async with (
+        aiosqlite.connect(DB_PATH) as db,
+        db.execute(
+            "SELECT id, name, created_by_urn, interval_seconds, job_template, next_fire_at "
+            "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
+            (now,),
+        ) as cur,
+    ):
+        due = await cur.fetchall()
+    for sid, name, submitter, interval, template, scheduled_for in due:
+        job_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"stiphos:schedule:{sid}:{scheduled_for!r}")
+        )
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO schedule_fires "
+                    "(schedule_id, scheduled_for, fired_at, job_id) VALUES (?, ?, ?, NULL)",
+                    (sid, scheduled_for, now),
+                )
+                await db.commit()
+                async with db.execute(
+                    "SELECT submitter_urn FROM jobs WHERE id=?", (job_id,)
+                ) as cur:
+                    existing = await cur.fetchone()
+            if existing is not None and existing[0] != submitter:
+                raise RuntimeError(
+                    "scheduled job identity belongs to another submitter"
+                )
+            if existing is None:
+                payload = json.loads(template)
+                payload["submitter_urn"] = submitter
+                try:
+                    await _create_job(
+                        JobCreate(**payload),
+                        _internal_agent_request(submitter),
+                        job_id=job_id,
+                    )
+                except sqlite3.IntegrityError:
+                    # Only a verified competing insertion of this exact private
+                    # identity is success; unrelated constraint errors propagate.
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        async with db.execute(
+                            "SELECT submitter_urn FROM jobs WHERE id=?", (job_id,)
+                        ) as cur:
+                            winner = await cur.fetchone()
+                    if winner is None or winner[0] != submitter:
+                        raise
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                await db.execute(
+                    "UPDATE schedule_fires SET job_id=? WHERE schedule_id=? AND scheduled_for=?",
+                    (job_id, sid, scheduled_for),
+                )
+                advanced = await db.execute(
+                    "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1 "
+                    "WHERE id=? AND next_fire_at=?",
+                    (now, max(now, scheduled_for) + interval, sid, scheduled_for),
+                )
+                if advanced.rowcount:
+                    await emit_event(
+                        db,
+                        "schedule.fired",
+                        {
+                            "schedule_id": sid,
+                            "name": name,
+                            "scheduled_for": scheduled_for,
+                            "job_id": job_id,
+                        },
+                    )
+                else:
+                    await db.commit()
+        except Exception:
+            # Do not consume a failed intent. The next tick retries its same ID.
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "scheduled dispatch failed for %s", sid
+            )
+
+
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
             await _reap_stale_agents_and_jobs(time.time())
             async with aiosqlite.connect(DB_PATH) as db:
-                # STIPHOS scheduler (2026-09-14): atomic fire identity via the
-                # schedule_fires table. For each due schedule, we INSERT a row
-                # keyed by (schedule_id, scheduled_for) — the unique index on
-                # that pair is the DB-level guarantee that no two scheduler
-                # ticks (in this process or across processes) can create two
-                # jobs for the same fire instant. If the INSERT fails on
-                # UNIQUE, another tick already fired this instant; skip and
-                # advance next_fire_at to prevent it from being considered
-                # due again next tick.
-                now_ts = time.time()
-                async with db.execute(
-                    "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count, "
-                    "next_fire_at FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
-                    (now_ts,),
-                ) as cur:
-                    due = [tuple(r) async for r in cur]
-                for sched_id, sname, sub_urn, interval, tpl_json, fcount, scheduled_for in due:
-                    try:
-                        tpl = json.loads(tpl_json)
-                        tpl["submitter_urn"] = sub_urn
-                        # Phase A: record the fire identity FIRST. If two
-                        # scheduler processes both saw the same due row, only
-                        # one INSERT INTO schedule_fires succeeds; the loser
-                        # sees IntegrityError and bails out for this tick.
-                        # This is the OUTBOX record — once it exists, the
-                        # fire has logically happened (and is deduped at the
-                        # DB level), independent of whether the
-                        # create_job/scheduled_jobs.UPDATE pair succeeded.
-                        try:
-                            await db.execute(
-                                "INSERT INTO schedule_fires "
-                                "(schedule_id, scheduled_for, fired_at, job_id) "
-                                "VALUES (?, ?, ?, NULL)",
-                                (sched_id, scheduled_for, now_ts),
-                            )
-                        except aiosqlite.IntegrityError:
-                            # Already fired by a concurrent tick. Skip job
-                            # creation but still advance next_fire_at so the
-                            # row stops being due on subsequent ticks.
-                            await db.execute(
-                                "UPDATE scheduled_jobs SET next_fire_at=? WHERE id=? "
-                                "AND next_fire_at <= ?",
-                                (now_ts + interval, sched_id, now_ts),
-                            )
-                            await emit_event(
-                                db,
-                                "schedule.fire_skipped",
-                                {
-                                    "schedule_id": sched_id,
-                                    "name": sname,
-                                    "scheduled_for": scheduled_for,
-                                    "reason": "duplicate_fire_record",
-                                },
-                            )
-                            continue
-                        # Phase B: synthesize the JobCreate and insert the job.
-                        # The fire record is now the durable, deduped
-                        # commitment that THIS fire happened. If
-                        # create_job fails, the schedule_fires row remains
-                        # (so the next tick does NOT re-fire the same
-                        # instant), but the job itself is missing — which
-                        # is intentional: we don't want a crash to leave
-                        # a phantom next_fire_at + an already-fired record
-                        # with no actual job. Operators can inspect
-                        # schedule_fires.job_id IS NULL to find such gaps.
-                        created_job_id = None
-                        created = await create_job(JobCreate(**tpl), _internal_agent_request(sub_urn))
-                        if isinstance(created, dict):
-                            created_job_id = created.get("id")
-                        if created_job_id:
-                            await db.execute(
-                                "UPDATE schedule_fires SET job_id=? "
-                                "WHERE schedule_id=? AND scheduled_for=?",
-                                (created_job_id, sched_id, scheduled_for),
-                            )
-                        # Phase C: advance next_fire_at. Done in the same
-                        # transaction as the fire record INSERT and the
-                        # schedule_fires.job_id UPDATE above (the outer
-                        # `async with aiosqlite.connect(...)` commits at
-                        # the bottom of this block). That commit is the
-                        # atomic boundary: either all three happen
-                        # (fire-record + job + advancement) or none of
-                        # them do.
-                        await db.execute(
-                            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
-                            "fire_count=fire_count+1 WHERE id=?",
-                            (now_ts, now_ts + interval, sched_id),
-                        )
-                        await emit_event(
-                            db,
-                            "schedule.fired",
-                            {
-                                "schedule_id": sched_id,
-                                "name": sname,
-                                "scheduled_for": scheduled_for,
-                                "fire_count": fcount + 1,
-                                "next_at": now_ts + interval,
-                                "job_id": created_job_id,
-                            },
-                        )
-                    except Exception as se:
-                        print(f"scheduler error {sched_id}: {se}", flush=True)
-                if due:
-                    await db.commit()
+                await _fire_due_schedules(time.time())
                 # 4. Auto-cancel stale jobs (queued > 7 days untouched)
                 stale_job_cutoff = time.time() - 7 * 24 * 3600
                 async with db.execute(
@@ -1671,8 +1662,9 @@ async def dashboard():
 @app.get("/dashboard.js")
 async def dashboard_script():
     """Serve the packaged dashboard program as a same-origin CSP-safe asset."""
-    from fastapi.responses import Response
     from importlib.resources import files
+
+    from fastapi.responses import Response
 
     source = files("mnemos.hive_mind").joinpath("dashboard.html").read_text(encoding="utf-8")
     marker = '<script id="dashboard-code" type="text/plain">'
@@ -1939,6 +1931,10 @@ async def whoami(host: str, pid: int):
 
 @app.post("/v1/jobs")
 async def create_job(req: JobCreate, request: Request):
+    return await _create_job(req, request)
+
+
+async def _create_job(req: JobCreate, request: Request, *, job_id: str | None = None):
     """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
 
     ROLE ENFORCEMENT (user directive 2026-05-23):
@@ -1947,7 +1943,7 @@ async def create_job(req: JobCreate, request: Request):
     Workers attempting to POST jobs get 403 — they should call /v1/jobs/next instead.
     """
     _require_agent(request, req.submitter_urn)
-    job_id = uuidv7()
+    job_id = job_id or uuidv7()
     now = time.time()
     repo_directive = re.match(r"^\s*\[repo:(?P<body>[^]]+)\]", req.description or "", re.IGNORECASE)
     if req.cacheable and not (req.pure and req.idempotent):
@@ -3241,81 +3237,86 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
     elif role not in {"admin", "disabled"}:
         raise HTTPException(403, "per-agent or admin credential required")
 
+    if since_id is None:
+        last_id_header = getattr(request, "headers", {}).get("last-event-id")
+        if last_id_header:
+            try:
+                since_id = int(last_id_header)
+            except ValueError:
+                raise HTTPException(422, "Last-Event-ID must be an integer") from None
+    if since_id is not None and since_id < 0:
+        raise HTTPException(422, "event cursor must be non-negative")
     sub_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_EVENT_QUEUE_SIZE)
     EVENT_QUEUE[sub_id] = queue
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COALESCE(MAX(id), 0) FROM events") as cur:
+                high_watermark = int((await cur.fetchone())[0])
+    except BaseException:
+        EVENT_QUEUE.pop(sub_id, None)
+        raise
+    initial_cursor = high_watermark if since_id is None else since_id
 
     async def gen():
+        cursor = initial_cursor
+        last_ping = time.monotonic()
         try:
-            # catch-up phase
-            if since_id is not None:
+            while not await request.is_disconnected():
+                # Persistence is the delivery source, including live traffic.
+                # The queue only wakes this reader: overflow cannot discard a
+                # payload. Polling also observes commits from other processes.
                 async with aiosqlite.connect(DB_PATH) as db:
-                    async with db.execute("SELECT COALESCE(MAX(id), ?) FROM events", (since_id,)) as cur:
-                        high_watermark = int((await cur.fetchone())[0])
-                    catchup_cursor = since_id
-                    while catchup_cursor < high_watermark:
-                        batch = []
+                    async with db.execute(
+                        "SELECT id, ts, kind, payload FROM events WHERE id>? ORDER BY id LIMIT ?",
+                        (cursor, SSE_CATCHUP_PAGE_SIZE),
+                    ) as cur:
+                        batch = await cur.fetchall()
+                if caller_urn:
+                    # A stream must not retain an old capability or credential
+                    # after agent policy changes or token revocation.
+                    async with aiosqlite.connect(DB_PATH) as db:
                         async with db.execute(
-                            "SELECT id, ts, kind, payload FROM events "
-                            "WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
-                            (catchup_cursor, high_watermark, SSE_CATCHUP_PAGE_SIZE),
+                            "SELECT 1 FROM agent_credentials WHERE urn=? AND token_hash=?",
+                            (caller_urn, _token_hash(_bearer_token(request) or "")),
                         ) as cur:
-                            async for r in cur:
-                                batch.append(r)
-                        if not batch:
-                            break
-                        for r in batch:
-                            evt = {
-                                "id": r[0],
-                                "ts": r[1],
-                                "kind": r[2],
-                                "payload": json.loads(r[3]),
-                            }
-                            if not await _event_visible_to_agent(evt, caller_urn, caller_ctx, time.time()):
-                                continue
+                            if not await cur.fetchone():
+                                return
+                    try:
+                        current_ctx = await _claim_agent_context(caller_urn)
+                    except HTTPException:
+                        return
+                else:
+                    current_ctx = caller_ctx
+                if batch:
+                    for row in batch:
+                        cursor = int(row[0])
+                        evt = {
+                            "id": cursor,
+                            "ts": row[1],
+                            "kind": row[2],
+                            "payload": json.loads(row[3]),
+                        }
+                        if await _event_visible_to_agent(
+                            evt, caller_urn, current_ctx, time.time()
+                        ):
                             yield {
-                                "id": str(evt["id"]),
+                                "id": str(cursor),
                                 "event": evt["kind"],
-                                "data": json.dumps({"ts": evt["ts"], "kind": evt["kind"], "payload": evt["payload"]}),
+                                "data": json.dumps(evt),
                             }
-                        catchup_cursor = int(batch[-1][0])
-            # live stream
-            last_ping = time.time()
-            while True:
-                if await request.is_disconnected():
-                    break
+                    continue
                 try:
-                    evt = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
-                    if not await _event_visible_to_agent(evt, caller_urn, caller_ctx, time.time()):
-                        continue
-                    # F04/STIPHOS (2026-09-14): live SSE events now carry the
-                    # SAME persisted event id the catch-up/history read path
-                    # uses. Yield the wire `id:` field so the client can
-                    # resume cleanly with since_id=N on reconnect — turning a
-                    # queue-full drop into a recoverable gap instead of a
-                    # silent miss. A missing id here would indicate an
-                    # emit_event call that bypassed the persistence write
-                    # (e.g. an in-memory-only fan-out); we fall back to
-                    # omitting the wire id rather than fabricating one.
-                    wire_id = evt.get("id")
-                    wire_kwargs = {
-                        "event": evt["kind"],
-                        "data": json.dumps(evt),
-                    }
-                    if wire_id is not None:
-                        wire_kwargs["id"] = str(wire_id)
-                    yield wire_kwargs
+                    await asyncio.wait_for(
+                        queue.get(), timeout=min(1.0, SSE_PING_INTERVAL)
+                    )
                 except asyncio.TimeoutError:
-                    if time.time() - last_ping >= SSE_PING_INTERVAL:
+                    if time.monotonic() - last_ping >= SSE_PING_INTERVAL:
                         yield {"event": "ping", "data": str(int(time.time()))}
-                        last_ping = time.time()
+                        last_ping = time.monotonic()
         finally:
             EVENT_QUEUE.pop(sub_id, None)
 
-    # Use the same ping interval for the sse_starlette keep-alive task as
-    # the inline generator's queue.get() timeout — both honour the
-    # SSE_PING_INTERVAL module constant so tests can shrink it without
-    # waiting 15s for keep-alives.
     return EventSourceResponse(gen(), ping=SSE_PING_INTERVAL)
 
 
@@ -3429,7 +3430,7 @@ async def mcp_rpc(body: dict, request: Request):
         if method == "message.publish":
             return await publish_message(MessagePublish(**params), request)
         if method == "message.list":
-            return await list_messages(**params)
+            return await list_messages(request=request, **params)
     except HTTPException as e:
         return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:

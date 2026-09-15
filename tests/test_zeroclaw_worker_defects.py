@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 _WORKER_PATH = Path(__file__).parents[1] / "deploy" / "zeroclaw-fanout" / "zeroclaw_worker.py"
 _SPEC = importlib.util.spec_from_file_location("zeroclaw_worker_under_test", _WORKER_PATH)
 assert _SPEC and _SPEC.loader
@@ -382,7 +381,13 @@ def test_execution_result_is_persisted_before_cross_service_acknowledgements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = []
-    job = {"id": "job-12345678", "kind": "review", "description": "review", "routing_metadata": {}}
+    job = {
+        "id": "job-12345678",
+        "claim_token": "attempt-token",
+        "kind": "review",
+        "description": "review",
+        "routing_metadata": {},
+    }
     claims = iter([job, None])
 
     monkeypatch.setattr(worker, "register", lambda: "urn:worker")
@@ -399,7 +404,8 @@ def test_execution_result_is_persisted_before_cross_service_acknowledgements(
         },
     )
 
-    def fake_update(_job_id, status, result, require_ack=False):
+    def fake_update(_job_id, status, result, require_ack=False, claim_token=None):
+        assert claim_token == "attempt-token"
         events.append(("hive", status, dict(result)))
         if status == "done":
             worker._running = False

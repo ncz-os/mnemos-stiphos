@@ -57,6 +57,9 @@ def _json_loads(value: Any, default: Any = None) -> Any:
         return default
     if hasattr(value, "read"):
         value = value.read()
+    # Thin drivers can materialize JSON-constrained CLOBs as Python values.
+    if isinstance(value, (dict, list, bool, int, float)):
+        return value
     if value in ("", b""):
         return default
     if isinstance(value, bytes):
@@ -886,6 +889,7 @@ class OracleHiveMindRepository(HiveMindRepository):
 
     @staticmethod
     def _normalized_strings(value: Any) -> set[str]:
+        value = _read_lob(value)
         loaded = _json_loads(value, value) if isinstance(value, (str, bytes)) else value
         if not loaded:
             return set()
@@ -1149,7 +1153,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             "submitter_urn": row[1],
             "parent_job_id": _raw_to_uuid(row[2]),
             "kind": row[3],
-            "description": row[4],
+            "description": _read_lob(row[4]),
             "priority": row[5],
             "deadline": _dt_to_ts(row[6]),
             "required_capabilities": _json_loads(row[7], None),
