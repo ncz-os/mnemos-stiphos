@@ -86,6 +86,7 @@ async def repo_case(request: pytest.FixtureRequest, tmp_path) -> AsyncIterator[t
 
     if repo_cls is OracleHiveMindRepository:
         repo = _make_oracle_repo()
+        await repo.init()
         await _cleanup_jobs(repo, project)
         try:
             yield "oracle", repo, project
@@ -119,7 +120,7 @@ def _cleanup_sqlite_jobs(db_path: str, project: str) -> None:
 def _cleanup_oracle_jobs(repo: OracleHiveMindRepository, project: str) -> None:
     with repo._pool.acquire() as conn:
         cur = conn.cursor()
-        cur.execute("DELETE FROM memory_jobs WHERE project = :project", {"project": project})
+        cur.execute("DELETE FROM jobs WHERE project = :project", {"project": project})
         conn.commit()
 
 

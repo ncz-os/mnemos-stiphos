@@ -14,6 +14,7 @@ from mnemos.hive_mind.oracle_repository import (
     ORACLE_SCHEMA_VERSION,
     OracleHiveMindRepository,
     OracleSchemaCompatibilityError,
+    _json_loads,
 )
 from mnemos.hive_mind.repository import SqliteHiveMindRepository
 
@@ -386,7 +387,8 @@ async def test_oracle_queued_insert_accepts_complete_service_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oracle_direct_claim_is_atomic_and_returns_service_shape() -> None:
+@pytest.mark.parametrize("materialized", [False, True])
+async def test_oracle_direct_claim_is_atomic_and_returns_service_shape(materialized) -> None:
     conn = _FakeConnection()
     job_id = uuid.uuid4()
     started = dt.datetime(2026, 5, 28, tzinfo=dt.timezone.utc)
@@ -427,6 +429,18 @@ async def test_oracle_direct_claim_is_atomic_and_returns_service_shape() -> None
             json.dumps({}),
         )
     ]
+    description = "fix it " + "x" * 7000
+
+    class Lob:
+        def read(self):
+            return description
+
+    row = list(conn.job_rows[0])
+    row[4] = Lob()
+    if materialized:
+        for index in (7, 8, 11, 12, 32):
+            row[index] = json.loads(row[index])
+    conn.job_rows = [tuple(row)]
     repo = OracleHiveMindRepository(user="u", password="p", dsn="d", pool=_FakePool(conn))
 
     status, claimed = await repo.claim_job_by_id(
@@ -447,6 +461,8 @@ async def test_oracle_direct_claim_is_atomic_and_returns_service_shape() -> None
     assert claimed is not None
     assert claimed["id"] == str(job_id)
     assert claimed["claimed_by"] == "urn:worker"
+    assert claimed["description"] == description
+    json.dumps(claimed)  # No live LOB escapes into HTTP serialization.
     sql_text = "\n".join(sql for sql, _ in conn.statements)
     assert "FOR UPDATE SKIP LOCKED" in sql_text
     assert "claimed_provider=:claimed_provider" in sql_text
@@ -497,3 +513,22 @@ async def test_fresh_canonical_ddl_produces_schema_accepted_on_init() -> None:
     repo = OracleHiveMindRepository(user="u", password="p", dsn="d", pool=_FakePool(conn))
 
     await repo.init()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [["worker"], {"required_subscription_pools": ["codex"]}, [], {}, True, 12, 1.5],
+)
+def test_oracle_json_accepts_materialized_driver_values(value):
+    assert _json_loads(value) == value
+
+
+@pytest.mark.parametrize("wrap_lob", [False, True])
+def test_oracle_json_and_subscription_pools_accept_text(wrap_lob):
+    class Lob:
+        def read(self):
+            return '["Codex Subscription"]'
+
+    value = Lob() if wrap_lob else '["Codex Subscription"]'
+    assert _json_loads(value) == ["Codex Subscription"]
+    assert OracleHiveMindRepository._normalized_strings(value) == {"codex_subscription"}
