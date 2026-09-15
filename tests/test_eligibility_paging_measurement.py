@@ -23,6 +23,22 @@ index or change the queue query. If a later commit concludes that an
 index is justified by these numbers, that change should be a separate,
 focused commit with before/after numbers — this test is intentionally
 shape-stable so it can be re-run after a fix.
+
+RATIO VS. ABSOLUTE COST — read both before acting on this. The 20,000-row
+scenario below produces a 113-114x ratio between high-skew and low-skew
+polls, which clears the "50x+ is justified" threshold this module states.
+But a ratio alone is not sufficient grounds to act: re-running the same
+three scenarios at N_JOBS=100/2,000 (this fleet's realistic queue depth —
+a handful of Hive workers, not a hyperscale job service) puts the
+high-skew scenario's ABSOLUTE cost at ~1ms or less, indistinguishable
+from noise for a poll that happens on a ~30s worker heartbeat cadence
+(directive 12). An index/query change was drafted against the 20k ratio
+alone (2026-09-14) and correctly stopped before merging once the smaller-N
+numbers were checked — the ratio was real, but the corpus size producing
+it was not representative of how this system actually runs. Before
+proposing an eligibility-index fix from this test's output, re-run it at
+a queue depth this deployment could plausibly reach, and act on THAT
+number, not the 20k one.
 """
 
 from __future__ import annotations
