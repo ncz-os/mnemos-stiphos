@@ -27,7 +27,6 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-
 from mnemos.hive_mind import service
 from mnemos.hive_mind.repository import SqliteHiveMindRepository
 
@@ -661,7 +660,7 @@ def test_malformed_events_do_not_leak(monkeypatch, tmp_path) -> None:
                 await db.execute(
                     "INSERT INTO events (ts, kind, payload, agent_urn) "
                     "VALUES (?, ?, ?, NULL)",
-                    (3.0, "schedule.fired", json.dumps({"name": "BROADCAST-OK"})),
+                    (3.0, "notice", json.dumps({"name": "BROADCAST-OK"})),
                 )
                 await db.commit()
 

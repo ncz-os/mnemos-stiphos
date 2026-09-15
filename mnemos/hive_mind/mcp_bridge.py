@@ -24,24 +24,28 @@ Tools:
 
 from __future__ import annotations
 
-import secrets
 import json
 import os
+import secrets
 from typing import Any
 
 import httpx
 import uvicorn
-from mcp.server import Server, NotificationOptions
+from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent, Resource, Prompt
+from mcp.types import Prompt, Resource, TextContent, Tool
+from mnemos.hive_mind.config import (
+    mcp_hive_url_env,
+    mcp_mnemos_token_env,
+    mcp_mnemos_url_env,
+    mcp_port_env,
+)
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
 from starlette.routing import Mount, Route
-
-from mnemos.hive_mind.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
 
 HIVE_URL = mcp_hive_url_env()
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
@@ -105,7 +109,13 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="hive.agent_list",
             description="List registered agents in the GRAEAE Hive Mind.",
-            inputSchema={"type": "object", "properties": {"kind": {"type": "string"}, "status": {"type": "string"}}},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "status": {"type": "string"},
+                },
+            },
         ),
         Tool(
             name="hive.agent_register",
@@ -140,7 +150,10 @@ async def handle_list_tools() -> list[Tool]:
                     "kind": {"type": "string"},
                     "description": {"type": "string"},
                     "priority": {"type": "integer", "default": 0},
-                    "required_capabilities": {"type": "array", "items": {"type": "string"}},
+                    "required_capabilities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "eligible_kinds": {"type": "array", "items": {"type": "string"}},
                     "deadline": {"type": "number"},
                     "parent_job_id": {"type": "string"},
@@ -195,7 +208,14 @@ async def handle_list_tools() -> list[Tool]:
                     "id": {"type": "string"},
                     "status": {
                         "type": "string",
-                        "enum": ["queued", "claimed", "running", "done", "failed", "cancelled"],
+                        "enum": [
+                            "queued",
+                            "claimed",
+                            "running",
+                            "done",
+                            "failed",
+                            "cancelled",
+                        ],
                     },
                     "result": {
                         "type": "object",
@@ -203,6 +223,10 @@ async def handle_list_tools() -> list[Tool]:
                             "provider_used": {"type": "string"},
                             "model_used": {"type": "string"},
                         },
+                    },
+                    "claim_token": {
+                        "type": "string",
+                        "description": "Token from this execution's successful claim; required for claimed jobs.",
                     },
                     "claimed_by": {"type": "string"},
                     "agent_token": {
@@ -212,6 +236,32 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["id", "status", "agent_token"],
+            },
+        ),
+        Tool(
+            name="hive.job_lease_renew",
+            description="Renew the current execution's progress lease.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "claim_token": {"type": "string"},
+                    "agent_token": {"type": "string", "writeOnly": True},
+                },
+                "required": ["id", "claim_token", "agent_token"],
+            },
+        ),
+        Tool(
+            name="hive.job_lease_cancel",
+            description="Release the current execution's claim and requeue the job.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "claim_token": {"type": "string"},
+                    "agent_token": {"type": "string", "writeOnly": True},
+                },
+                "required": ["id", "claim_token", "agent_token"],
             },
         ),
         Tool(
@@ -277,7 +327,11 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="mnemos.memory_get",
             description="Get a MNEMOS memory by id (mem_XXX).",
-            inputSchema={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+            inputSchema={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
         ),
     ]
     if GRAEAE_ENABLED:
@@ -371,6 +425,14 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
             jid = payload.pop("id")
             agent_token = payload.pop("agent_token", None)
             r = await _hive("PATCH", f"/v1/jobs/{jid}", agent_token=agent_token, json=payload)
+        elif name in {"hive.job_lease_renew", "hive.job_lease_cancel"}:
+            action = "renew" if name.endswith("renew") else "cancel"
+            r = await _hive(
+                "POST",
+                f"/v1/jobs/{args['id']}/lease/{action}",
+                agent_token=args.get("agent_token"),
+                json={"claim_token": args["claim_token"]},
+            )
         elif name == "hive.message_publish":
             payload = dict(args)
             agent_token = payload.pop("agent_token", None)
@@ -427,7 +489,12 @@ async def _list_prompts() -> list[Prompt]:
 
 
 if not _MCP_DECORATOR_API:
-    from mcp.types import CallToolResult, ListPromptsResult, ListResourcesResult, ListToolsResult
+    from mcp.types import (
+        CallToolResult,
+        ListPromptsResult,
+        ListResourcesResult,
+        ListToolsResult,
+    )
 
     async def _v2_list_tools(_context, _params):
         return ListToolsResult(tools=await handle_list_tools())

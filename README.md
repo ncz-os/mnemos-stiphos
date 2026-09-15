@@ -130,3 +130,25 @@ supported by our open-source infrastructure partners:
   [Buildkite Open Source](https://buildkite.com/pricing) program.
 
 Thank you to both for backing open-source software.
+
+### Dispatch and delivery guarantees
+
+Scheduled dispatch persists an intent keyed by schedule and firing time before
+creating its deterministic job ID. An interrupted dispatch retries that same ID;
+only an acknowledged existing/created job advances the schedule. This avoids
+holding a SQLite writer transaction across job creation and prevents duplicate
+jobs after competing scheduler ticks or a crash between creation and linking.
+
+Workers must echo the claim's `claim_token` on every attempt update. The bundled
+zeroclaw worker also renews `/v1/jobs/{id}/lease/renew` during its bounded execution
+and stops its child when ownership can no longer be confirmed. MCP exposes the
+same token and lease operations. An agent heartbeat alone does not renew an
+attempt lease; third-party workers must adopt the job lease protocol.
+
+SSE uses persisted event IDs and treats in-process queues as wake notifications.
+It supports `Last-Event-ID`/`since_id`, replays queue overflow, and polls for commits
+from other processes. Job and scheduled-job events follow job visibility;
+directed messages follow their sender/recipient audience. Agent streams refresh
+eligibility and validate their credential before each fetched batch. Offline or
+revoked agents lose the stream. Replay is bounded by retained event history;
+clients must retain their last received event ID and reconnect on interruption.

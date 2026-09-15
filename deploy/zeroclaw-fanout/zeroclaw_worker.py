@@ -29,18 +29,19 @@ Env:
 """
 
 from __future__ import annotations
+
 import json
 import os
+import random
+import re as _re
+import signal
 import socket
 import subprocess
-import tempfile
 import sys
+import tempfile
 import time
-import urllib.request
 import urllib.error
-import random
-import signal
-import re as _re
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -434,7 +435,7 @@ def heartbeat():
         return
     # If hive lost our URN (404 or "not found"), re-register
     if code == 404 or (code in (400, 410) and resp and "not found" in str(resp).lower()):
-        print(f"[zc-worker] heartbeat 404 — URN expired, re-registering", flush=True)
+        print("[zc-worker] heartbeat 404 — URN expired, re-registering", flush=True)
         register()
 
 
@@ -450,9 +451,32 @@ def claim_next_job() -> dict | None:
     return None
 
 
-def update_job(job_id: str, status: str, result: dict, *, require_ack: bool = False) -> bool:
+class JobLeaseLost(RuntimeError):
+    """The current execution no longer has a confirmed progress lease."""
+
+
+def renew_job_lease(job_id: str, claim_token: str) -> bool:
+    code, _ = _http(
+        "POST", f"/v1/jobs/{job_id}/lease/renew", {"claim_token": claim_token}
+    )
+    return 200 <= code < 300
+
+
+def update_job(
+    job_id: str,
+    status: str,
+    result: dict,
+    *,
+    require_ack: bool = False,
+    claim_token: str | None = None,
+) -> bool:
     global _running, _fatal_error
-    body = {"status": status, "result": result, "claimed_by": _urn}
+    body = {
+        "status": status,
+        "result": result,
+        "claimed_by": _urn,
+        "claim_token": claim_token,
+    }
     if isinstance(result, dict):
         t_in = result.get("tokens_in")
         t_out = result.get("tokens_out")
@@ -1220,10 +1244,7 @@ def run_zeroclaw(
                         # to HEARTBEAT_INTERVAL.
                         heartbeat()
                         if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
-                            try:
-                                job_heartbeat_fn(round(elapsed, 1))
-                            except Exception:
-                                pass
+                            job_heartbeat_fn(round(elapsed, 1))
                             last_job_hb = time.time()
                 last_stdout = _read_output_tail(stdout_file, 12000)
                 last_stderr = _read_output_tail(stderr_file, 4000)
@@ -1258,6 +1279,21 @@ def run_zeroclaw(
                 # Non-retryable failure — break + report
                 print(f"[zc-worker] non-retryable failure on {agent_alias} exit={proc.returncode}", flush=True)
                 break
+        except JobLeaseLost as exc:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            abandoned = {
+                "exit_code": -1,
+                "error": str(exc),
+                "execution_skipped": True,
+                "lease_lost": True,
+            }
+            if workspace:
+                abandoned["workspace_preserved"] = _preserve_workspace(
+                    workspace, job_id or "anon"
+                )
+            return abandoned
         except Exception as exc:
             last_stderr = f"{type(exc).__name__}: {exc}"
             print(f"[zc-worker] exc on {agent_alias}: {last_stderr[:200]}", flush=True)
@@ -1295,6 +1331,8 @@ def run_zeroclaw(
     publication_failed = False
     try:
         if workspace and proc and proc.returncode == 0:
+            if job_heartbeat_fn:
+                job_heartbeat_fn(round(time.time() - start, 1))
             changes = _capture_changes(workspace)
             result["files_changed"] = changes["files_changed"]
             result["diffstat"] = changes["diffstat"]
@@ -1330,15 +1368,33 @@ def main():
             backoff = min(backoff * 1.5, POLL_INTERVAL)
             continue
         backoff = 1.0
+        claim_token = job.get("claim_token")
+        if not claim_token:
+            print("[zc-worker] refusing unfenced claim", flush=True)
+            continue
         print(f"[zc-worker] claimed job {job['id'][:8]} kind={job['kind']} priority={job.get('priority')}", flush=True)
-        if not update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()}, require_ack=True):
+        if not update_job(
+            job["id"],
+            "running",
+            {"started_by": _urn, "started_at": time.time()},
+            require_ack=True,
+            claim_token=claim_token,
+        ):
             if not _running:
                 break
             continue
         job_id = job["id"]
 
-        def _job_hb(elapsed):
-            update_job(job_id, "running", {"heartbeat_at": time.time(), "elapsed_sec": elapsed})
+        def _job_hb(elapsed, job_id=job_id, claim_token=claim_token):
+            if not update_job(
+                job_id,
+                "running",
+                {"heartbeat_at": time.time(), "elapsed_sec": elapsed},
+                claim_token=claim_token,
+            ):
+                raise JobLeaseLost("job progress update rejected")
+            if not renew_job_lease(job_id, claim_token):
+                raise JobLeaseLost("job lease renewal rejected")
 
         saved_result = job.get("result") if isinstance(job.get("result"), dict) else None
         if saved_result and saved_result.get("_stiphos_execution_complete") is True:
@@ -1368,7 +1424,16 @@ def main():
                 }
             if result.get("execution_skipped") is True:
                 result["finished_at"] = time.time()
-                if not update_job(job["id"], "failed", result, require_ack=True) and not _running:
+                if (
+                    not update_job(
+                        job["id"],
+                        "failed",
+                        result,
+                        require_ack=True,
+                        claim_token=claim_token,
+                    )
+                    and not _running
+                ):
                     break
                 continue
             result["_stiphos_execution_complete"] = True
@@ -1376,7 +1441,9 @@ def main():
             # This acknowledgement is the durable execution boundary. If later
             # cross-service calls fail, the reaper may requeue the job but the
             # next worker resumes from this result instead of invoking a model.
-            if not update_job(job["id"], "running", result, require_ack=True):
+            if not update_job(
+                job["id"], "running", result, require_ack=True, claim_token=claim_token
+            ):
                 if not _running:
                     break
                 continue
@@ -1385,7 +1452,9 @@ def main():
         if not record_knemon_usage(job, result, status):
             break
         result["knemon_reconciled"] = True
-        if not update_job(job["id"], status, result, require_ack=True):
+        if not update_job(
+            job["id"], status, result, require_ack=True, claim_token=claim_token
+        ):
             if not _running:
                 break
             continue
