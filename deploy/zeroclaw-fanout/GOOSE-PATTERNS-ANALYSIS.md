@@ -22,7 +22,7 @@ pub struct TaskConfig {
 
 **zeroclaw 0.8 gap**: workspace path is per-agent-alias in `[agents.<alias>]` config, not per-task. Multiple concurrent jobs on same agent alias share the workspace → race.
 
-**Port**: shim already does per-job ephemeral workspace via `_prepare_workspace()` (commit 0939676). For upstream parity, zeroclaw could accept `--working-dir` CLI flag override or `--task-config` JSON envelope.
+**Port**: shim already does per-job ephemeral workspace via `_prepare_workspace()` (commit 1de9dff). For upstream parity, zeroclaw could accept `--working-dir` CLI flag override or `--task-config` JSON envelope.
 
 **Upstream PR opportunity**: add `--working-dir <path>` to `zeroclaw agent` CLI; agent treats this as per-invocation cwd override.
 
@@ -144,7 +144,7 @@ Manages session lifecycle, cleanup, recovery. Zeroclaw worker shim does this ad-
 
 ### Tier 1 — port to OUR shim (no upstream dep)
 
-1. **Workspace-per-job lifecycle** ✅ SHIPPED in commit `0939676` (mirrors goose's `parent_working_dir`).
+1. **Workspace-per-job lifecycle** ✅ SHIPPED in commit `1de9dff` (mirrors goose's `parent_working_dir`).
 2. **Recipe-style description prefix** ✅ PARTIAL — `[repo:URL branch:B base:M]` directive in description is a lightweight Recipe analog. Could grow to `[recipe:...]` with full JSON schema embed.
 3. **Structured output capture** — shim already reports `commits[]`, `files_changed[]`. Add schema validation if Recipe declares one.
 
